@@ -1,0 +1,18 @@
+# 构建产物
+build/
+dist/
+*.spec
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# 运行产物
+runs/
+*.log
+
+# 本地临时脚本
+.*.py
