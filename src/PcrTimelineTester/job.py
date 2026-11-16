@@ -187,8 +187,17 @@ class TuneJob:
         table[target.row][target.index] = target.to_raw(frame)
         return table
 
-    def _fetch(self, target: FrameTarget, frames: list[int], tag: str) -> list[float]:
+    def _fetch(
+        self,
+        target: FrameTarget,
+        frames: list[int],
+        tag: str,
+        ub: dict[int, "tuple[tuple[float, ...], ...]"] | None = None,
+    ) -> list[float]:
         outcomes = self.client.evaluate([self.table_with(target, frame) for frame in frames])
+        if ub is not None:
+            for frame, outcome in zip(frames, outcomes):
+                ub[frame] = outcome.ub_frames
         return [outcome.metric for outcome in outcomes]
 
     # -------------------------------------------------------------------- run
@@ -282,13 +291,16 @@ class TuneJob:
             f"（当前伤害 {fmt(option_base)}）---"
         )
         book = MetricBook(
-            fetch=lambda frames, tag: self._fetch(target, frames, tag),
+            fetch=lambda frames, tag: [],
             settings=self.search_settings,
             log=self.log,
             cancelled=self._cancel.is_set,
         )
+        # fetch 顺手把每个帧上「实际放出的 UB 帧」记进 book.ub，向下探时用来判断放不放得出来
+        book.fetch = lambda frames, tag: self._fetch(target, frames, tag, book.ub)
         result = search_run(
             self.search_settings, current_frame, option_base, book,
+            ub_row=target.row, ub_index=target.index,
             log=lambda line: self.log(f"    {line}"),
             cancelled=self._cancel.is_set,
         )

@@ -73,6 +73,16 @@ def signed(value: float) -> str:
     return f"+{fmt(value)}" if value > 0 else fmt(value)
 
 
+# 一场公会战里能被按到的帧数：早于 90 帧还放不出 UB，晚于 5399 帧战斗已经结束，
+# 两头都探没有意义，所以当成硬边界。
+FRAME_FLOOR = 90
+FRAME_CEILING = 5399
+# 目标 UB 在某一帧放不出来（实际 UB 跑到更后面去了）时，向下方向最多再探几次就收手。
+UB_MISS_LIMIT = 5
+# 同帧多刀 UB 用小数尾（550.001）区分顺序，所以比较实际帧时留这么点余量。
+UB_FRAME_TOLERANCE = 0.5
+
+
 @dataclass(frozen=True, slots=True)
 class SearchSettings:
     """Window parameters of the search (the plugin's ``SearchOptions``)."""
@@ -82,8 +92,8 @@ class SearchSettings:
     outer_probes: int = 3
     threshold_mode: ThresholdMode = ThresholdMode.ABSOLUTE
     threshold_value: float = 500_000.0
-    frame_min: int = 0
-    frame_max: int = 5399
+    frame_min: int = FRAME_FLOOR
+    frame_max: int = FRAME_CEILING
     peak_tolerance: float = 0.5
     memoize: bool = True
     max_battles: int = 0          # 0 = 不限制场次
@@ -96,8 +106,13 @@ class SearchSettings:
             raise ValueError("最大偏移必须是正整数")
         if self.outer_probes < 0:
             raise ValueError("外探次数不能是负数")
-        if self.frame_min < 0 or self.frame_max <= self.frame_min:
-            raise ValueError(f"帧范围无效：{self.frame_min}~{self.frame_max}")
+        # 帧范围夹到「游戏里按得到」的区间：低于 90 帧放不出 UB，高于 5399 帧没战斗了
+        frame_min = min(max(int(self.frame_min), FRAME_FLOOR), FRAME_CEILING)
+        frame_max = min(max(int(self.frame_max), FRAME_FLOOR), FRAME_CEILING)
+        if frame_max <= frame_min:
+            raise ValueError(f"帧范围无效：{frame_min}~{frame_max}（合法区间 {FRAME_FLOOR}~{FRAME_CEILING}）")
+        object.__setattr__(self, "frame_min", frame_min)
+        object.__setattr__(self, "frame_max", frame_max)
         if self.max_battles < 0:
             raise ValueError("场次上限不能是负数（0 表示不限制）")
         if self.chunk <= 0:
@@ -161,6 +176,40 @@ class SearchSettings:
             raise ValueError(f"搜索参数格式错误：{exc}") from exc
 
 
+UbTable = "dict[int, tuple[tuple[float, ...], ...]]"
+
+
+def _actual_ub(
+    ub_of: Callable[[int], "tuple[tuple[float, ...], ...] | None"],
+    ub_row: int,
+    ub_index: int,
+    frame: int,
+) -> float | None:
+    """这一帧上目标角色实际放出的那一刀 UB 的帧号（拿不到就是 None）。"""
+    if ub_row < 0:
+        return None
+    rows = ub_of(frame)
+    if not rows or ub_row >= len(rows):
+        return None
+    row = rows[ub_row]
+    if ub_index >= len(row):
+        return None
+    return float(row[ub_index])
+
+
+def _fired(
+    ub_of: Callable[[int], "tuple[tuple[float, ...], ...] | None"],
+    ub_row: int,
+    ub_index: int,
+    frame: int,
+) -> bool | None:
+    """这一帧上目标 UB 到底放出来了没有（None = 不知道，别据此下结论）。"""
+    if ub_row < 0 or ub_of(frame) is None:
+        return None
+    actual = _actual_ub(ub_of, ub_row, ub_index, frame)
+    return actual is not None and abs(actual - frame) <= UB_FRAME_TOLERANCE
+
+
 @dataclass
 class MetricBook:
     """Frame → damage cache, filled in batches through ``fetch``.
@@ -175,9 +224,14 @@ class MetricBook:
     cancelled: Callable[[], bool] = lambda: False
     cache: dict[int, float] = field(default_factory=dict)
     battles: int = 0
+    # 帧 → 每个玩家实际放 UB 的帧（由 fetch 顺手填，缺的帧就是不知道）
+    ub: dict[int, tuple[tuple[float, ...], ...]] = field(default_factory=dict)
 
     def get(self, frame: int) -> float:
         return self.cache[frame]
+
+    def ub_of(self, frame: int) -> tuple[tuple[float, ...], ...] | None:
+        return self.ub.get(frame)
 
     def prime(self, frame: int, metric: float) -> None:
         self.cache[frame] = float(metric)
@@ -248,6 +302,8 @@ def run(
     baseline_metric: float,
     book: MetricBook,
     *,
+    ub_row: int = -1,
+    ub_index: int = 0,
     log: Callable[[str], None] = print,
     cancelled: Callable[[], bool] = lambda: False,
 ) -> SearchResult:
@@ -276,10 +332,11 @@ def run(
 
     try:
         peak_frame, peak_metric = _probe(
-            settings, int(baseline_frame), baseline_metric, walk, log, cancelled
+            settings, int(baseline_frame), baseline_metric, walk, log, cancelled,
+            ub_row=ub_row, ub_index=ub_index, ub_of=book.ub_of,
         )
         result.peak_frame, result.peak_metric = peak_frame, peak_metric
-        _finalise(settings, result, log)
+        _finalise(settings, result, log, fired=lambda frame: _fired(book.ub_of, ub_row, ub_index, frame))
     except SearchCancelled:
         result.cancelled = True
         result.message = "已取消"
@@ -302,6 +359,10 @@ def _probe(
     walk: Callable[[list[int], str], Iterator[tuple[int, float]]],
     log: Callable[[str], None],
     cancelled: Callable[[], bool],
+    *,
+    ub_row: int = -1,
+    ub_index: int = 0,
+    ub_of: Callable[[int], "tuple[tuple[float, ...], ...] | None"] = lambda frame: None,
 ) -> tuple[int, float]:
     """Stages ①–⑦: coarse probing around the baseline, then fill the peak."""
     peak_frame, peak_metric = baseline_frame, baseline_metric
@@ -339,6 +400,25 @@ def _probe(
     # ④⑤ downward
     safety = 0
     lower_bound = max(settings.frame_min, baseline_frame - settings.max_offset)
+    miss_limit = min(UB_MISS_LIMIT, settings.outer_probes)
+    misses = 0
+
+    def cannot_fire(frame: int) -> bool:
+        """向下探时发现这一刀放不出来，再往前就没有意义了。"""
+        nonlocal misses
+        state = _fired(ub_of, ub_row, ub_index, frame)
+        if state is None or state:
+            misses = 0
+            return False
+        actual = _actual_ub(ub_of, ub_row, ub_index, frame)
+        misses += 1
+        if misses > miss_limit:
+            where = f"实际 UB 在 {fmt(actual)}" if actual is not None else "这一刀根本没放出来"
+            log(f"⛔ 帧 {frame} 放不出目标 UB（{where}）：再往前没有意义，向下方向到此结束")
+            return True
+        return False
+
+    stop_down = False
     while safety < 400:
         safety += 1
         if cancelled():
@@ -347,9 +427,14 @@ def _probe(
         for frame, metric in walk(list(range(peak_frame - step, win_down - 1, -step)), "down"):
             if metric > peak_metric:
                 peak_metric, peak_frame = metric, frame
+            if cannot_fire(frame):
+                stop_down = True
+                break
             if not settings.acceptable(baseline_metric, metric):
                 hit, threshold_frame = True, frame
                 break
+        if stop_down:
+            break
         if not hit:
             log(f"④ 向下探到窗口下界 {win_down}，未超阈值，转⑥")
             break
@@ -365,7 +450,10 @@ def _probe(
                 peak_metric, peak_frame, found = metric, frame, True
                 log(f"⑤ 外探发现更高值：{frame}→{fmt(metric)}，换峰值回到④")
                 break
-        if not found:
+            if cannot_fire(frame):
+                stop_down = True
+                break
+        if stop_down or not found:
             break
 
     # ⑥⑦ fill both sides of the peak frame by frame
@@ -378,6 +466,8 @@ def _probe(
             peak_metric, peak_frame = metric, frame
         if metric + settings.peak_tolerance < peak_metric:
             break
+        if cannot_fire(frame):
+            break
     log(f"⑦ 峰值 {peak_frame} 右侧逐帧补齐")
     count = 0
     for frame, metric in walk(list(range(peak_frame + 1, settings.frame_max + 1))[:fill_cap], "fillR"):
@@ -389,8 +479,17 @@ def _probe(
     return peak_frame, peak_metric
 
 
-def _finalise(settings: SearchSettings, result: SearchResult, log: Callable[[str], None]) -> None:
-    """Stage ⑧: among the visited frames take the best metric, then the earliest frame."""
+def _finalise(
+    settings: SearchSettings,
+    result: SearchResult,
+    log: Callable[[str], None],
+    *,
+    fired: Callable[[int], bool | None] = lambda frame: None,
+) -> None:
+    """Stage ⑧: among the visited frames take the best metric, then the earliest frame.
+
+    放不出目标 UB 的帧不算候选（写进去这一刀也不会按出来），除非全场只有这种帧。
+    """
     visited = result.visited
     if not visited:
         return
@@ -399,6 +498,9 @@ def _finalise(settings: SearchSettings, result: SearchResult, log: Callable[[str
         frame for frame, metric in visited.items()
         if abs(metric - best_metric) < settings.peak_tolerance
     ]
+    fired_inside = [frame for frame in inside if fired(frame) is not False]
+    if fired_inside:
+        inside = fired_inside
     if inside:
         result.peak_frame = min(inside)
         result.peak_metric = best_metric

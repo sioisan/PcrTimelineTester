@@ -80,6 +80,12 @@ tools/                    # 开发工具：run_tests.py（离线跑测器）、b
     此时 `parse_save` 会连 `SemanUBSequenceData` 一起忽略（`sequence = None`），不报错。
     想让第 i 条车道归别的角色，用 `SemanUBSequenceData`（0..4 的消费顺序），不是少写几行。
 
+16. **逐帧搜索的两个约束**：帧范围固定夹在 **90~5399**（`search.FRAME_FLOOR` /
+    `search.FRAME_CEILING`，`SearchSettings.__post_init__` 里用 `object.__setattr__` 夹回来）；
+    向下方向一旦发现「这一帧根本放不出 UB」（`MetricBook.ub_of()` 里实际 UB 帧 ≠ 请求帧，数据来自
+    `client.BattleOutcome.ub_frames` ← `Stats.UBTime`），最多再探
+    `min(search.UB_MISS_LIMIT=5, outer_probes)` 次就结束该方向；向上方向不做这个判断，别加。
+
 ## 开发环境事实
 
 - Python：3.10+（需要 tkinter，官方安装包自带；开发机上另外装过 openpyxl、httpx、PyInstaller）。

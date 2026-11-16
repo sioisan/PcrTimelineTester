@@ -45,6 +45,8 @@ class BattleOutcome:
     result: int
     seed: int
     expected: float | None = None
+    # Stats.UBTime：每个玩家实际放出 UB 的帧（用来判断「这一帧根本放不出来」）
+    ub_frames: tuple[tuple[float, ...], ...] = ()
 
     @property
     def is_expected(self) -> bool:
@@ -52,6 +54,24 @@ class BattleOutcome:
 
 
 RESULT_NAMES = {-1: "INVALID", 0: "WIN", 1: "LOSE", 2: "TIME_OVER", 3: "RETIRE"}
+
+
+def _ub_frames(stats: dict) -> tuple[tuple[float, ...], ...]:
+    """``Stats.UBTime`` → 每个玩家实际放 UB 的帧（缺失就当没有）。"""
+    rows = stats.get("UBTime")
+    if not isinstance(rows, list):
+        return ()
+    parsed: list[tuple[float, ...]] = []
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        values = [
+            float(value)
+            for value in row
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        ]
+        parsed.append(tuple(values))
+    return tuple(parsed)
 
 
 def _expected_damage(result: dict) -> float | None:
@@ -201,6 +221,7 @@ class SimulatorClient:
             result=int(result_code) if isinstance(result_code, (int, float)) else -1,
             seed=seed,
             expected=expected,
+            ub_frames=_ub_frames(stats),
         )
 
     # -------------------------------------------------------------- evaluate
@@ -249,6 +270,7 @@ class SimulatorClient:
                 result=items[0].result,
                 seed=items[0].seed,
                 expected=(sum(expected) / len(expected)) if all(e is not None for e in expected) else None,
+                ub_frames=items[0].ub_frames,
             ))
         return outcomes
 

@@ -125,6 +125,60 @@ def test_settings_reject_silly_values() -> None:
         SearchSettings(threshold_mode=ThresholdMode.PERCENT, threshold_value=2)
 
 
+def test_frames_are_clamped_to_the_playable_window() -> None:
+    loose = SearchSettings(frame_min=0, frame_max=99_999)
+    assert (loose.frame_min, loose.frame_max) == (90, 5399)
+    assert SearchSettings(frame_min=10).frame_min == 90
+    assert SearchSettings(frame_max=6000).frame_max == 5399
+    with pytest.raises(ValueError):
+        SearchSettings(frame_min=5399)
+
+
+def test_stops_going_down_once_the_target_ub_cannot_fire() -> None:
+    """放不出来的方向不再往前探：第一次发现后最多再探 min(5, 外探次数) 次。"""
+
+    def make(ub_row: int):
+        def fetch(frames: list[int], tag: str) -> list[float]:
+            return [landscape(frame) for frame in frames]
+
+        settings = SearchSettings(step=5, max_offset=100, outer_probes=3, chunk=1)
+        book = MetricBook(fetch=fetch, settings=settings, log=lambda _: None)
+        # 目标 UB 在任何请求帧上都放不出来：实际 UB 总比请求的帧晚 100 帧
+        for frame in range(80, 6200):
+            book.ub[frame] = ((float(frame + 100),),)
+        result = run(
+            settings, 500, landscape(500), book,
+            ub_row=ub_row, ub_index=0, log=lambda _: None,
+        )
+        # visited = 真正消费掉的帧（≈ 实际打的那些帧）
+        return result, sorted([frame for frame in result.visited if frame < 500], reverse=True)
+
+    result, downward = make(0)
+    assert result.ok
+    # 向下从 495 开始，一次次都放不出来：最多再探 min(5, 3) = 3 次，到 480 就收手
+    assert {495, 490, 485, 480} <= set(downward)
+    assert min(downward) >= 470  # 没有一路探到窗口下界
+
+    # 不给 UB 信息时照旧往下试到底（窗口下界 400）
+    _, control = make(-1)
+    assert min(control) == 400
+
+
+def test_never_picks_a_frame_where_the_ub_cannot_fire() -> None:
+    """伤害一样时取最早帧，但放不出 UB 的帧不算候选。"""
+
+    def fetch(frames: list[int], tag: str) -> list[float]:
+        return [1000.0 for _ in frames]  # 完全平坦
+
+    settings = SearchSettings(step=5, max_offset=20, chunk=4)
+    book = MetricBook(fetch=fetch, settings=settings, log=lambda _: None)
+    # 500 帧之后要哪帧给哪帧；早于 500 帧按不出来，摸轴器会把它挪到 500
+    for frame in range(90, 6200):
+        book.ub[frame] = ((float(frame) if frame >= 500 else 500.0,),)
+    result = run(settings, 500, 1000.0, book, ub_row=0, ub_index=0, log=lambda _: None)
+    assert result.peak_frame == 500
+
+
 def test_settings_round_trip() -> None:
     settings = SearchSettings(step=3, outer_probes=5, threshold_mode=ThresholdMode.PERCENT, threshold_value=0.02)
     same = SearchSettings.from_dict(settings.to_dict())
