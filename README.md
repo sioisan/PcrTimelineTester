@@ -1,4 +1,4 @@
-# PcrTimelineTester v1.0.0
+# PcrTimelineTester v1.0.1
 
 按**期望伤害**择优，把 PCRCalculator 公会战轴里每条 UB 的**帧号**调到最优点。独立命令行程序，
 全程只通过 PCRCalculator 的 HTTP `/simulate` 接口打战斗，不需要游戏客户端、
@@ -423,6 +423,11 @@ modes.register(modes.ModeSpec(
   对不上（这条轴的语义数据和帧轴不是同一次状态）就改成用帧轴 + 自动语义老师重新推起点，
   日志里会写「起点改成用帧轴重新推出」，这样基线伤害和逐帧搜索的数字一致。
 - 语义 GA 的「同时调角色序列」只在轴自带 `SemanUBSequenceData` 时才有意义（见上节）。
+- 轴里的 `SemanUBExecTimeData` **超过 5 行时只保留前 5 行**，多出来的行直接丢掉，并在日志里
+  打一行提示——摸轴器只按位号 0~4 取车道（`SemanUbManager.IsUbExec(pos)` 里
+  `pos > 4 || pos >= queues.Length` 直接返回 false），第 6 行以后永远不会被执行。
+  **少于 5 行则整条语义轴当成没有（空）**，同样在日志里说一句，此时 `SemanUBSequenceData`
+  也一起忽略——凑不满五条车道的语义数据本来就用不了。
 - 队伍的**行顺序**由摸轴器按 `searchAreaWidth` 重排，所以本程序不做重排、也不改顺序；
   若你的轴行顺序与摸轴器内部顺序不同，请先在摸轴器里确认。
 - `--samples > 1` 会按 `abs(seed)+i` 派生种子取平均伤害。
@@ -458,8 +463,8 @@ python tools\build_frozen.py               # → dist\PcrTimelineTester.exe（�
 Release 上（`generate_release_notes` 会自动写变更列表）：
 
 ```powershell
-git tag -a v1.0.0 -m "PcrTimelineTester v1.0.0"
-git push origin v1.0.0
+git tag -a v1.0.1 -m "PcrTimelineTester v1.0.1"
+git push origin v1.0.1
 ```
 
 - **只想手动发一次**（不打标签）：Actions → `build-frozen` → `Run workflow`，这只产出 artifact、

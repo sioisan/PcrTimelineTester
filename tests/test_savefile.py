@@ -127,3 +127,38 @@ def test_reads_a_hand_built_cell_string(tmp_path, five_rows) -> None:
     path = write_save(tmp_path / "手工.xlsx", json.loads(json.dumps(raw)))
     assert read_save(path).frames == five_rows
     assert len(encoded) < 32767
+def test_keeps_the_first_five_semantic_rows_and_warns(tmp_path, five_rows) -> None:
+    """多出来的语义车道摸轴器永远不会执行，所以只留前五行、丢掉其余并提示。"""
+    raw = timeline_raw(five_rows)
+    group = raw["playerGroupData"]
+    group["SemanUBExecTimeData"] = [[1], [2], [3], [4], [5], [6, 7], [8]]
+    group["useSemanMode"] = True
+    group["SemanUBSequenceData"] = []
+    path = write_save(tmp_path / "七行.xlsx", raw)
+
+    notes: list[str] = []
+    save = read_save(path, log=notes.append)
+
+    assert save.semantic == [[1], [2], [3], [4], [5]]
+    assert len(notes) == 1
+    assert "只保留前 5 行" in notes[0]
+    assert "丢掉了后面 2 行" in notes[0]
+
+
+def test_treats_a_short_semantic_axis_as_empty(tmp_path, five_rows) -> None:
+    """不足五条车道的语义数据用不了，整条当成没有（连角色序列一起忽略）。"""
+    raw = timeline_raw(five_rows)
+    group = raw["playerGroupData"]
+    group["SemanUBExecTimeData"] = [[1], [2], [3]]
+    group["useSemanMode"] = True
+    group["SemanUBSequenceData"] = [0]
+    path = write_save(tmp_path / "三行.xlsx", raw)
+
+    notes: list[str] = []
+    save = read_save(path, log=notes.append)
+
+    assert save.semantic == []
+    assert save.has_semantic is False
+    assert save.sequence is None
+    assert len(notes) == 1
+    assert "只有 3 行" in notes[0] and "当成没有语义数据" in notes[0]

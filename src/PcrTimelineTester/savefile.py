@@ -22,7 +22,8 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+import sys
+from typing import Any, Callable
 from zipfile import BadZipFile
 
 from openpyxl import Workbook, load_workbook
@@ -82,16 +83,56 @@ def frame_axis(value: Any, label: str = "UBExecTimeData") -> FrameAxis:
     return rows
 
 
-def semantic_axis(value: Any, label: str = "SemanUBExecTimeData") -> list[list[int]]:
-    """校验语义 UB 轴（五条基因序列），允许为空。"""
+def _notice(log: Callable[[str], None] | None, message: str) -> None:
+    """把提示交给调用方的日志；没给就打到 stdout（冻结版 stdout 是 None，跳过）。"""
+    if log is not None:
+        log(message)
+        return
+    stream = sys.stdout
+    if stream is None:
+        return
+    try:
+        print(message)
+    except (ValueError, OSError):
+        pass
+
+
+def semantic_axis(
+    value: Any,
+    label: str = "SemanUBExecTimeData",
+    *,
+    log: Callable[[str], None] | None = None,
+) -> list[list[int]]:
+    """校验语义 UB 轴（五条基因序列），允许为空。
+
+    摸轴器只按位号 0..4 取车道（``SemanUbManager.IsUbExec(pos)`` 里
+    ``pos > 4 || pos >= queues.Length`` 直接返回 false），多出来的行永远不会被
+    消费。所以超过 ``CHARACTER_ROWS`` 行时保留前五行、丢掉其余并打一行提示；
+    不足五行则整条语义轴当成没有（空），只打一行提示。
+    """
     if value is None or value == [] or value == ():
         return []
     if not isinstance(value, (list, tuple)):
         raise ValueError(f"{label} 必须是数组")
-    if len(value) != CHARACTER_ROWS:
-        raise ValueError(f"{label} 必须有 {CHARACTER_ROWS} 条角色行，实际 {len(value)} 行")
+    rows = list(value)
+    if len(rows) > CHARACTER_ROWS:
+        dropped = len(rows) - CHARACTER_ROWS
+        rows = rows[:CHARACTER_ROWS]
+        _notice(
+            log,
+            f"提示：{label} 有 {len(value)} 行，只保留前 {CHARACTER_ROWS} 行"
+            f"（丢掉了后面 {dropped} 行——摸轴器只认前 {CHARACTER_ROWS} 条车道，"
+            f"多出来的行永远不会被执行）",
+        )
+    if len(rows) != CHARACTER_ROWS:
+        _notice(
+            log,
+            f"提示：{label} 只有 {len(rows)} 行（凑不满 {CHARACTER_ROWS} 条车道），"
+            f"当成没有语义数据",
+        )
+        return []
     lanes: list[list[int]] = []
-    for row_index, row in enumerate(value):
+    for row_index, row in enumerate(rows):
         if not isinstance(row, (list, tuple)):
             raise ValueError(f"{label} 第 {row_index + 1} 行必须是数组")
         lanes.append([integer(item, f"{label} 第 {row_index + 1} 行基因") for item in row])
@@ -303,6 +344,7 @@ def parse_save(
     *,
     names: dict[int, str] | None = None,
     require_frames: bool = True,
+    log: Callable[[str], None] | None = None,
 ) -> SaveFile:
     """Validate a decoded timeline save and pull out the axes.
 
@@ -331,8 +373,8 @@ def parse_save(
     frames = frame_axis(group.get("UBExecTimeData") or [])
     if not any(frames) and raw.get("UBExecTime"):
         frames = frame_axis(raw["UBExecTime"], "UBExecTime")
-    semantic = semantic_axis(group.get("SemanUBExecTimeData") or [])
-    sequence = sequence_axis(group.get("SemanUBSequenceData"), semantic)
+    semantic = semantic_axis(group.get("SemanUBExecTimeData") or [], log=log)
+    sequence = sequence_axis(group.get("SemanUBSequenceData"), semantic) if semantic else None
     if (not frames or not any(frames)) and not semantic:
         raise ValueError(
             "这条轴里既没有帧数据也没有语义 UB 数据。请确认导出的是 PCRCalculator 的轴（savePage 页）"
@@ -350,7 +392,12 @@ def parse_save(
     )
 
 
-def read_save(path: Path, *, require_frames: bool = True) -> SaveFile:
+def read_save(
+    path: Path,
+    *,
+    require_frames: bool = True,
+    log: Callable[[str], None] | None = None,
+) -> SaveFile:
     """Read any PCRCalculator exported ``.xlsx`` timeline."""
     path = Path(path)
     if path.suffix.lower() != ".xlsx":
@@ -368,7 +415,8 @@ def read_save(path: Path, *, require_frames: bool = True) -> SaveFile:
     except (KeyError, OSError, EOFError, ValueError, BadZipFile, InvalidFileException) as exc:
         raise ValueError(f"无法读取 Excel 的 {SAVE_SHEET} 轴数据，文件 {path.name}，{exc}") from exc
     return parse_save(
-        path, raw, str(header or SAVE_SHEET), names=read_names(path), require_frames=require_frames,
+        path, raw, str(header or SAVE_SHEET), names=read_names(path),
+        require_frames=require_frames, log=log,
     )
 
 

@@ -1647,7 +1647,7 @@ class App(ttk.Frame):
         try:
             # 语义 GA 也能吃「只有语义数据」的轴，所以这里不强求帧轴；
             # 切到逐帧搜索时再检查有没有帧。
-            save = read_save(path, require_frames=False)
+            save = read_save(path, require_frames=False, log=self._append_log)
         except (ValueError, OSError) as exc:
             messagebox.showerror(TITLE, f"打不开这条轴：\n{exc}")
             self.status_var.set("轴文件读取失败")

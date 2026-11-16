@@ -22,7 +22,7 @@ src/PcrTimelineTester/      # 代码
   cli.py gui.py session.py modes.py job.py search.py frames.py savefile.py
   client.py server.py report.py settings.py anneal.py roster.py datas.py
   ga/                     # 语义 GA：engine/semantics/fingerprint/evaluator/settings/job
-tests/                    # pytest 用例（166 个）
+tests/                    # pytest 用例（167 个）
 tools/                    # 开发工具：run_tests.py（离线跑测器）、build_frozen.py、launch.py
 .github/workflows/        # build-frozen：测试 + PyInstaller + 打 tag 自动发布
 ```
@@ -72,6 +72,13 @@ tools/                    # 开发工具：run_tests.py（离线跑测器）、b
     游戏名、角色名、角色立绘、从 `unit_info.php` / `Datas` 整理出来的角色资料（职能、属性、宽度）
     版权归 Cygames，**不在 MIT 范围内**；README 的「## 许可」一节是给用户看的归属声明，别删。
     发布冻结版时可以带上图标包，但要在说明里写清「仅供个人研究使用」。
+15. **语义轴的行数**：`SemanUBExecTimeData` 在服务器侧是**长度固定 5 的车道数组**，下标 =
+    玩家位号 0~4（`SemanUbManager.IsUbExec(pos)` 里 `pos > 4 || pos >= queues.Length` 直接 false，
+    `UBNums` 也是 5 格）。所以 `savefile.semantic_axis()` 对**超过 5 行**的轴保留前五行、丢掉其余，
+    并通过 `log` 打一行中文提示（GUI 会进日志，CLI 直接 print，`_notice()` 里对冻结版
+    `sys.stdout is None` 做了保护）；**少于 5 行则整条语义轴当成没有（返回空列表）**，也打一句提示，
+    此时 `parse_save` 会连 `SemanUBSequenceData` 一起忽略（`sequence = None`），不报错。
+    想让第 i 条车道归别的角色，用 `SemanUBSequenceData`（0..4 的消费顺序），不是少写几行。
 
 ## 开发环境事实
 

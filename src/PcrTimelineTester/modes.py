@@ -164,8 +164,8 @@ class ModeSpec:
     plan: Callable[[SaveFile, Any], list[str]] = field(default=lambda save, settings: [])
 
     # ---- 便捷方法（前端只调这些）
-    def read_save(self, path: Path) -> SaveFile:
-        return read_save(path, require_frames=self.needs_frames)
+    def read_save(self, path: Path, *, log: Callable[[str], None] | None = None) -> SaveFile:
+        return read_save(path, require_frames=self.needs_frames, log=log)
 
     def defaults(self) -> dict[str, Any]:
         return {param.name: param.default for param in self.params}
