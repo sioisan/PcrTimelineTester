@@ -473,3 +473,81 @@ def write_roster_report(path: Path, summary: dict, *, names: dict[int, str] | No
     lines.append("- 结果表与报告只列伤害最高的 100 支队伍（跑完会更多，内存里只留前 100）。")
     lines.append("- 中断不会导出结果轴，`state.json` 记着排到第几支队伍，`resume` 接着跑。")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_zero_report(path: Path, summary: dict, *, names: dict[int, str] | None = None) -> None:
+    """0 押轴的报告：退火找到的逐刀 O/X 设定与刷新过程。"""
+    names = names or {}
+    best = summary.get("best") or {}
+    units = [int(unit) for unit in (summary.get("units") or ())]
+    plan = best.get("plan") or []
+    lines: list[str] = []
+    lines.append("# PCR 0押轴结果")
+    lines.append("")
+    lines.append(f"- 轴文件：`{summary.get('excel')}`")
+    lines.append(f"- 运行目录：`{summary.get('run_dir')}`")
+    lines.append("- 优化模式：0押轴（整场不打手动 UB，退火逐刀决定 O=SET / X=AUTO）")
+    lines.append(
+        f"- 接口：`{summary.get('endpoint')}`（战斗 {summary.get('battle_time')} 秒，种子 {summary.get('seed')}）"
+    )
+    if units:
+        lines.append(f"- 站位：{lineup_names(units, names)}")
+    lines.append(
+        f"- 退火规模：{_int_text(summary.get('iterations'))} 轮 × 每轮 {_int_text(summary.get('batch'))} 个候选 × "
+        f"{_int_text(summary.get('samples'))} 个种子；实际模拟 {_int_text(summary.get('battles'))} 场"
+    )
+    lines.append(
+        f"- 最多几刀：每个角色最多排 {_int_text(summary.get('ub_limit'))} 刀"
+        "（实际能排几刀跟着回包里的 TP 满帧条数走——刀数本来就会随打法变化）"
+    )
+    baseline = summary.get("baseline") or {}
+    lines.append(
+        f"- 基线：纯 SET {_int_text(baseline.get('set_damage'))} ／ 纯 AUTO {_int_text(baseline.get('auto_damage'))}"
+    )
+    lines.append(f"- 属性：{'满级满 Rank' if summary.get('to_max_attr') else '沿用轴里的练度'}")
+    lines.append("")
+    lines.append("## 结论")
+    lines.append("")
+    lines.append(f"- 最优期望伤害：{_int_text(best.get('damage'))}")
+    lines.append(f"- 战斗帧 / 结果：{_int_text(best.get('frames'))} 帧 / {_result_label(best.get('result'))}")
+    if summary.get("result_workbook"):
+        lines.append(f"- 结果表：`{summary.get('result_workbook')}`（轴保持原样，另加一页「0押结果」）")
+    lines.append("")
+    lines.append("## 最优方案的逐刀设定")
+    lines.append("")
+    lines.append("| 站位 | 角色 | 逐刀设定（O=SET、X=AUTO） |")
+    lines.append("| --- | --- | --- |")
+    for index, unit in enumerate(units):
+        flags = plan[index] if index < len(plan) else []
+        body = "".join("O" if flag else "X" for flag in flags) or "O"
+        tail = "O" if (flags[-1] if flags else True) else "X"
+        lines.append(f"| {index + 1} | {_cell(names.get(unit, str(unit)))} | `{body}`（之后一律 {tail}） |")
+    lines.append("")
+    history = list(summary.get("history") or ())
+    if history:
+        lines.append("## 刷新记录")
+        lines.append("")
+        lines.append("| 轮次 | 逐刀设定 | 期望伤害 |")
+        lines.append("| --- | --- | --- |")
+        for item in history:
+            lines.append(
+                f"| {_int_text(item.get('round'))} | `{_cell(item.get('text') or '')}` | {_int_text(item.get('damage'))} |"
+            )
+        lines.append("")
+    lines.append("## 说明")
+    lines.append("")
+    lines.append("- 0 押 = 不打手动 UB，只决定「TP 满的那一刻按不按」：`O` = 到点就按（SET），`X` = 不按，交给自动（会等角色空下来）。")
+    lines.append("- 判据取自接口：`Stats.TpChangeEvents` 里 `CrossedReady` 的那一帧就是 TP 刚满的帧（`CalcStats` 带 256 才有）。某个角色第 k 刀选 `O`，就把第 k 个 TP 满帧写进 `UBExecTimeList`。")
+    lines.append("- 同一角色逐刀可以不一样：`O X O O …` 表示第一次 TP 满时按、第二次不按、第三次起都按；表里省略的刀一律沿用最后一刀。")
+    lines.append("- 刀数不写死：跳过一刀会让后面 TP 满的时机整体变化，所以每轮都用最近一次回包重新算 TP 满帧，能按出 14 刀时也会排到 14 刀（上限「最多几刀」）。")
+    lines.append("- 请求里不带导入轴原本的帧，`SetToggles` 全关、`IsAutoMode` 开（没写进帧表的刀由自动兜底）。")
+    lines.append("- 中断不会导出结果表，`state.json` 记着当前最优方案，`resume` 接着跑。")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _result_label(value: object) -> str:
+    try:
+        result = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return ""
+    return {0: "胜利", 1: "失败", 2: "超时", 3: "撤退"}.get(result, str(result))

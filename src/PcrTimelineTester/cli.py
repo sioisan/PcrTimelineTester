@@ -330,6 +330,13 @@ def _run_ga(
 def _command_inspect(args: argparse.Namespace) -> int:
     mode = getattr(args, "mode", "frame") or "frame"
     save = mode_registry.get(mode).read_save(_path(args.excel))
+    if mode == mode_registry.CYCLE:
+        spec = mode_registry.get(mode)
+        settings = spec.from_values({**_arg_overrides(spec, args), **_overrides(args)}, save)
+        print(f"轴文件 {save.path.name}，队伍 {'、'.join(save.unit_names)}")
+        for line in spec.plan(save, settings):
+            print(line)
+        return 0
     if mode == "ga":
         _print_ga_plan(save, _ga_settings(args, save))
         return 0
@@ -456,6 +463,11 @@ def _command_tune(args: argparse.Namespace) -> int:
         return _run_tune(save, job_settings, search_settings, run_dir)
     # 其它（以后新接的）模式：参数全部由模式自己声明，这里只按名字传值。
     values = {**spec.defaults(), **_arg_overrides(spec, args), **overrides}
+    if mode == mode_registry.CYCLE:
+        common = _job_settings(args, save)
+        for name in ("seed", "battle_time", "samples", "timeout", "batch_size"):
+            if name not in overrides:
+                values[name] = getattr(common, name)
     settings = spec.from_values(values, save)
     endpoint = getattr(args, "endpoint", None)
     if endpoint and hasattr(settings, "endpoint"):
@@ -486,7 +498,11 @@ def _command_resume(args: argparse.Namespace) -> int:
         job_settings = JobSettings.from_dict(config.get("settings") or {})
         search_settings = SearchSettings.from_dict(config.get("search") or {})
         return _run_tune(save, job_settings, search_settings, run_dir, resume_state=state)
-    settings = spec.from_values(config.get("settings") or {}, save)
+    saved = dict(config.get("settings") or {})
+    endpoint = saved.pop("endpoint", None) if mode == mode_registry.CYCLE else None
+    settings = spec.from_values(saved, save)
+    if endpoint:
+        settings = replace(settings, endpoint=getattr(args, "endpoint", None) or endpoint)
     return _run_session(spec, save, settings, run_dir, resume_state=state, note="不会导出任何结果")
 
 

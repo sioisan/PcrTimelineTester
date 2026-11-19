@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from enum import IntEnum
 
 ROLE_COUNT = 5
+DEFAULT_MAX_LANE_LENGTH = 96
 Genome = tuple[tuple[int, ...], ...]
 EMPTY_GENOME: Genome = ((),) * ROLE_COUNT
 
@@ -117,6 +118,29 @@ def full_genome(prefix: Genome, genome: Genome) -> Genome:
     return tuple(fixed + lane for fixed, lane in zip(prefix, genome, strict=True))
 
 
+def point_edits(genome: Genome, pools: Genome):
+    """轮流替换五个角色的同一刀，优先测试同一条件的微调以及直接放 UB。"""
+    for delta in (-1, 1, 0):
+        for index in range(max(map(len, genome), default=0)):
+            for role, lane in enumerate(genome):
+                if index >= len(lane):
+                    continue
+                value = lane[index]
+                allele = value + delta if delta else 0
+                if allele != value and allele in pools[role]:
+                    yield role, index, allele
+
+
+def apply_point_edit(genome: Genome, edit) -> Genome:
+    role, index, allele = edit
+    lane = genome[role]
+    return genome[:role] + (lane[:index] + (allele,) + lane[index + 1:],) + genome[role + 1:]
+
+
+def point_neighbors(genome: Genome, pools: Genome):
+    return (apply_point_edit(genome, edit) for edit in point_edits(genome, pools))
+
+
 def search_pools(
     seed: Genome,
     extra: Genome,
@@ -131,6 +155,11 @@ def search_pools(
     skill_offsets = (0, 10, 200, 210, 220, 300, 310, 320)
     for role, (seed_lane, extra_lane) in enumerate(zip(seed, extra, strict=True)):
         values = {0, *seed_lane, *extra_lane, *range(1, delay + 1)}
+        # 老师在新语义口径下会给出六位编码。保留轴上观察到的条件，只扩展其末位。
+        for gene in seed_lane:
+            if 100000 <= gene < 200000:
+                base = gene - gene % 10
+                values.update(range(base, base + 10))
         if legacy_ub:
             for target in range(ROLE_COUNT + 1):
                 base = 10000 + target * 1000 + (900 if target == role else 100)

@@ -42,40 +42,20 @@ _utf8_console()
 
 ROOT = Path(__file__).resolve().parents[1]
 ENTRY = ROOT / "tools" / "launch.py"
-# 构建用的图标：项目根的 icon.ico 优先，其次 assets/app.ico。
-ICON_SOURCES = (ROOT / "icon.ico", ROOT / "assets" / "app.ico")
-ICON_SIZES = (16, 24, 32, 48, 64, 128, 256)
+ICON_PNG = ROOT / "src" / "PcrTimelineTester" / "app-icon.png"
 DIST = ROOT / "dist"
 BUILD = ROOT / "build"
 
 
-def _prepare_icon() -> Path | None:
-    """找出要嵌进 exe 的图标；能扩成多尺寸就扩一份到 build/ 里。
+def _prepare_icon() -> Path:
+    """桌面程序资源使用单张 256 像素 ICO，窗口直接读取 512 像素原图。"""
+    from PIL import Image
 
-    只有一个 256×256 的 .ico 时，任务栏/资源管理器里的小图标是缩放出来的（会糊）；
-    这里用 Pillow 生成 16~256 的多尺寸版，拿不到 Pillow 就直接用原文件。
-    """
-    source = next((item for item in ICON_SOURCES if item.is_file()), None)
-    if source is None:
-        print("提示：项目根没有 icon.ico，这一次的 exe 用 PyInstaller 默认图标。")
-        return None
-    try:
-        from PIL import Image
-    except ImportError:
-        print(f"提示：没装 Pillow，只能用原始尺寸的图标：{source.name}（想要 16~256 的多尺寸版：python -m pip install pillow）")
-        return source
-    try:
-        with Image.open(source) as image:
-            base = image.convert("RGBA")
-        BUILD.mkdir(parents=True, exist_ok=True)
-        target = BUILD / "icon.ico"
-        sizes = [(size, size) for size in ICON_SIZES if size <= max(base.size)]
-        base.save(target, format="ICO", sizes=sizes)
-        print(f"图标：{source.name} → {target.relative_to(ROOT)}（{len(sizes)} 种尺寸：{', '.join(str(s) for s in ICON_SIZES if s <= max(base.size))}）")
-        return target
-    except Exception as exc:  # 图标出问题不该挡住构建
-        print(f"提示：图标转换失败（{type(exc).__name__}: {exc}），改用原文件 {source.name}")
-        return source
+    BUILD.mkdir(parents=True, exist_ok=True)
+    target = BUILD / "icon.ico"
+    with Image.open(ICON_PNG) as source:
+        source.resize((256, 256), Image.Resampling.LANCZOS).save(target, sizes=[(256, 256)])
+    return target
 
 
 def _sha256(path: Path) -> str:
@@ -112,8 +92,7 @@ def build(*, clean: bool, name: str, console: bool = False) -> int:
         str(ENTRY),
     ]
     icon = _prepare_icon()
-    if icon is not None:
-        args[3:3] = ["--icon", str(icon)]
+    args[3:3] = ["--icon", str(icon), "--add-data", f"{ICON_PNG}{os.pathsep}PcrTimelineTester"]
     print(" ".join(args))
     code = subprocess.call(args, cwd=str(ROOT))
     if code != 0:

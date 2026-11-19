@@ -13,12 +13,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from itertools import islice
 from typing import Sequence
 
 import httpx
 
-from ..client import TuneError, simulation_url
+from ..client import TuneError, _expected_damage, simulation_url
 from .engine import BattleSample, Evaluation
 from .fingerprint import ActionProgressFingerprint
 from .semantics import (
@@ -85,6 +84,7 @@ class GaEvaluator:
         self.log = log
         self.client = httpx.Client(timeout=self.timeout)
         self.battles = 0
+        self.expected_damage = True
 
     # ------------------------------------------------------------------ 生命周期
     def close(self) -> None:
@@ -129,7 +129,7 @@ class GaEvaluator:
             "IsAutoMode": auto,
             "IsSetMode": set_mode,
             "IsSemanMode": semantic,
-            "NeedOnceResult": False,
+            "NeedOnceResult": self.expected_damage and calc_stats == FAST_BASE,
         }
         if capture and self.capture_frames:
             request["ActionProgressFrames"] = list(self.capture_frames)
@@ -164,8 +164,8 @@ class GaEvaluator:
     def _send(self, requests: list[dict]) -> list[dict]:
         chunks = (requests[start:start + self.batch_size] for start in range(0, len(requests), self.batch_size))
         results: list[dict] = []
-        while window := list(islice(chunks, 1)):
-            results.extend(self._post(window[0]))
+        for chunk in chunks:
+            results.extend(self._post(chunk))
         return results
 
     # ------------------------------------------------------------------ 解析
@@ -181,16 +181,21 @@ class GaEvaluator:
         counts = response.get("SemanUBNum")
         if not isinstance(counts, list):
             raise TuneError("接口回包缺少 SemanUBNum 数组")
-        damage = stats.get("TotalDamage")
-        if isinstance(damage, bool) or not isinstance(damage, (int, float)):
-            raise TuneError("接口回包里没有 Stats.TotalDamage")
         return Evaluation(
-            damage=int(round(damage)),
+            damage=self._damage(response, stats),
             frames=int(response.get("BattleFrames") or 0),
             result=int(response.get("Result") or 0),
             ub_counts=tuple(int(count) for count in counts),
             fingerprint=fingerprint,
         )
+
+    def _damage(self, response: dict, stats: dict) -> int:
+        damage = _expected_damage(response) if self.expected_damage else None
+        if damage is None:
+            damage = stats.get("TotalDamage")
+        if isinstance(damage, bool) or not isinstance(damage, (int, float)):
+            raise TuneError("接口回包里没有可用的伤害")
+        return int(round(damage))
 
     def _aggregate(self, responses: list[dict], *, capture: bool = False) -> Evaluation:
         first = self._evaluation(responses[0], capture=capture)
@@ -291,10 +296,7 @@ class GaEvaluator:
         damages: list[int] = []
         for response in responses:
             stats = _object(response.get("Stats"), "Stats")
-            damage = stats.get("TotalDamage")
-            if isinstance(damage, bool) or not isinstance(damage, (int, float)):
-                raise TuneError("接口回包里没有 Stats.TotalDamage")
-            damages.append(int(round(damage)))
+            damages.append(self._damage(response, stats))
         return int(round(sum(damages) / len(damages)))
 
     def initial_axis(self, *, frames: Sequence[Sequence[float]] = (), lanes: Genome = EMPTY_GENOME,
@@ -315,4 +317,9 @@ class GaEvaluator:
             self.request_for(calc_stats=FAST_BASE, lanes=lanes, roles=roles, semantic=True, seed=seed)
             for seed in self.seeds
         ])
-        return self._aggregate(responses), self.lanes_to_frames(lanes, roles)
+        # FAST_BASE 已包含 UB_TIME。老算器缺少此字段时单独取一次。
+        evaluation = self._aggregate(responses)
+        rows = responses[0]["Stats"].get("UBTime")
+        if self.seeds[0] == self.battle_seed and isinstance(rows, list) and rows:
+            return evaluation, [list(map(float, row)) for row in rows]
+        return evaluation, self.lanes_to_frames(lanes, roles)

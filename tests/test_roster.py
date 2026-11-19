@@ -72,8 +72,7 @@ def test_settings_reject_bad_groups():
         _settings(pool=(1001, 1002, 1003, 1004), groups=())
     with pytest.raises(ValueError):
         _settings(groups=(GroupSpec("A", (1001, 1002), 1), GroupSpec("A", (1003,), 1)))
-    with pytest.raises(ValueError):
-        _settings(groups=(GroupSpec("A", (9999,), 1),))
+    assert team_count(_settings(groups=(GroupSpec("A", (9999,), 1),))) == 0
     with pytest.raises(ValueError):
         _settings(groups=(GroupSpec("A", (1001, 1002), 3), GroupSpec("B", (1003, 1004), 3)))
 
@@ -89,13 +88,23 @@ def test_team_count_matches_iter_teams():
     settings = _settings(groups=(GroupSpec("A", (1001, 1002, 1003), 2), GroupSpec("B", (1004,), 1)))
     teams = list(iter_teams(settings))
     assert len(teams) == team_count(settings)
-    # A 里 C(3,2)=3 种，B 固定 1 人，剩 2 个名额从 8 个未分组里选 = 28
-    assert len(teams) == 3 * 28
+    # A 可以上两人或三人。B 的必上角色占一席。
+    assert len(teams) == 3 * 28 + 8
     for team in teams:
         assert len(team) == 5
         assert len(set(team)) == 5
-        assert sum(1 for unit in team if unit in (1001, 1002, 1003)) == 2
+        assert sum(1 for unit in team if unit in (1001, 1002, 1003)) >= 2
         assert 1004 in team
+
+
+def test_overlap_deduplicates_group_seats_before_filling_the_team():
+    groups = (GroupSpec("A", (1001, 1002, 1003), 1), GroupSpec("B", (1001, 1002, 1004), 1))
+    settings = _settings(groups=groups)
+    teams = list(iter_teams(settings))
+    expected = {frozenset(team) for team in itertools.combinations(POOL, 5)
+                if all(len(set(group.members).intersection(team)) >= group.minimum for group in groups)}
+    assert set(map(frozenset, teams)) == expected
+    assert len(teams) == team_count(settings) == len(expected)
 
 
 def test_iter_teams_without_groups_is_plain_combinations():
@@ -202,7 +211,7 @@ def test_job_enumerates_all_teams_and_exports_best(tmp_path):
     summary = job.run()
     assert summary["teams_total"] == 21
     assert summary["teams_done"] == 21
-    assert summary["battles"] == 22  # 21 支队伍 + 参考那一场
+    assert summary["battles"] == 21  # 原队的参考成绩可复用
     assert summary["best_team"] == [1003, 1004, 1005, 1006, 1007]
     assert summary["export"]["team"] == [1003, 1004, 1005, 1006, 1007]
     assert summary["reference"] is not None
@@ -287,8 +296,8 @@ def test_evaluate_team_uses_the_batch_channel(tmp_path):
         )
     finally:
         evaluator.close()
-    # every_combo=False 只跑全 SET，所以只有一条
-    assert [combo for combo, _score in rows_all] == [(True,) * 5]
+    # 单队试算固定跑满 32 种，即使阵容搜索只勾了全 SET。
+    assert {combo for combo, _score in rows_all} == set(itertools.product((False, True), repeat=5))
     assert lines and "→" in lines[0]
 
 
@@ -411,3 +420,11 @@ def test_lineup_text_numbers_the_positions() -> None:
         "4 涅妃 SET（O）、5 蜘蛛 SET（O）"
     )
     assert lineup_names(team, names, width=_width) == "花音、纳娜、星猫、涅妃、蜘蛛"
+
+
+def test_shared_members_can_satisfy_more_than_five_combined_minima():
+    shared = POOL[:3]
+    settings = _settings(groups=(GroupSpec("甲", shared, 3), GroupSpec("乙", shared + (9999,), 3)))
+    teams = list(iter_teams(settings))
+    assert len(teams) == team_count(settings) == 36
+    assert all(set(shared) <= set(team) <= set(POOL) for team in teams)

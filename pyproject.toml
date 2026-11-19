@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PcrTimelineTester"
-version = "1.0.2"
+version = "1.1.0"
 description = "PcrTimelineTester：基于 PCRCalculator /simulate 接口的独立调轴工具（逐帧搜索 + 语义 GA）"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -29,6 +29,9 @@ PcrTimelineTester-gui = "PcrTimelineTester.gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+PcrTimelineTester = ["app-icon.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

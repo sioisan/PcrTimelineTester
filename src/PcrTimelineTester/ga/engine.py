@@ -15,7 +15,10 @@ from dataclasses import dataclass, replace
 from random import Random
 
 from .fingerprint import ActionProgressFingerprint, finite_number, fingerprints_close
-from .semantics import Genome, ROLE_COUNT, full_genome, genome_from_rows, integer
+from .semantics import (
+    DEFAULT_MAX_LANE_LENGTH, Genome, ROLE_COUNT, apply_point_edit, full_genome,
+    genome_from_rows, integer, point_edits,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -32,7 +35,7 @@ class GAConfig:
     migration_interval: int = 10
     migrants_ratio: float = 0.08
     disaster_patience: int = 20
-    max_lane_length: int = 96
+    max_lane_length: int = DEFAULT_MAX_LANE_LENGTH
     fingerprint_distance: float | None = 1.0
     seed: int = 42
 
@@ -261,6 +264,7 @@ def optimize(
     battle_time: int,
     evaluator: BatchEvaluator,
     config: GAConfig,
+    fixed_lengths: bool = False,
     resume: GenerationState | None = None,
     on_checkpoint: CheckpointCallback | None = None,
 ) -> GenerationState:
@@ -285,7 +289,8 @@ def optimize(
 
     def new_genome() -> Genome:
         length = min(2, config.max_lane_length)
-        return tuple(tuple(rng.choice(pool) for _ in range(length)) for pool in pools)
+        lengths = tuple(map(len, initial)) if fixed_lengths else (length,) * ROLE_COUNT
+        return tuple(tuple(rng.choice(pool) for _ in range(n)) for n, pool in zip(lengths, pools))
 
     def rank(candidate: Candidate) -> int | float:
         return candidate.evaluation.score(battle_time)
@@ -297,18 +302,13 @@ def optimize(
         score_a, score_b = max(1, rank(first)), max(1, rank(second))
         chance = score_a / (score_a + score_b)
         children = []
-        for role, (a, b) in enumerate(zip(first.genome, second.genome, strict=True)):
-            # 固定前缀在可变部分之前已经被消耗掉了。
-            active = min(first.evaluation.ub_counts[role], second.evaluation.ub_counts[role])
-            active = max(0, active - len(prefix[role]))
-            length = min(config.max_lane_length, active + 1)
-            split = rng.randrange(length)
-            best = a if score_a > score_b else b
-            lane = []
-            for index in range(length):
-                source = best if index < split else (a if rng.random() < chance else b)
-                lane.append(source[index] if index < len(source) else 0)
-            children.append(tuple(lane))
+        for a, b in zip(first.genome, second.genome, strict=True):
+            donor, other = (a, b) if rng.random() < chance else (b, a)
+            if rng.random() < 0.5:
+                children.append(donor)
+            else:
+                split = rng.randrange(min(len(a), len(b)) + 1)
+                children.append(other[:split] + donor[split:])
         return tuple(children)
 
     def mutate(genome: Genome, chance: float) -> Genome:
@@ -316,7 +316,10 @@ def optimize(
         for values, pool in zip(genome, pools, strict=True):
             lane = list(values)
             if rng.random() < chance:
-                operation = rng.randrange(4)
+                operation = rng.randrange(2 if fixed_lengths else 4)
+                if not lane and fixed_lengths:
+                    result.append(())
+                    continue
                 if not lane:
                     lane.append(rng.choice(pool))
                 elif operation == 0:
@@ -332,15 +335,23 @@ def optimize(
         return tuple(result)
 
     first_generation = state.generation + 1 if state is not None else 0
+    local_center = None
+    local = []
     for generation in range(first_generation, config.generations + 1):
         behavior_duplicates = 0
         if state is None:
-            batches = [[new_genome() for _ in range(size)] for size in sizes]
+            # 各岛都从原轴附近和随机短轴两侧起步，保留成熟轴后半场的配合。
+            batches = [
+                [mutate(initial, 0.4) if i % 2 == 0 else new_genome() for i in range(size)]
+                for size in sizes
+            ]
             batches[0][0] = initial
             if config.population > 1:
                 zero_island = 1 if config.islands > 1 else 0
                 zero_index = 0 if zero_island else 1
-                batches[zero_island][zero_index] = ((0,),) * ROLE_COUNT
+                batches[zero_island][zero_index] = (
+                    tuple((0,) * len(lane) for lane in initial) if fixed_lengths else ((0,),) * ROLE_COUNT
+                )
         else:
             parents = [
                 parent_representatives(island, config.fingerprint_distance, battle_time)
@@ -355,19 +366,28 @@ def optimize(
             chance = min(1.0, max(config.mutation_floor, config.mutation * (config.mutation_decay ** generation)))
             stale = generation - state.best_generation - 1
             disaster = config.disaster_patience > 0 and stale > 0 and stale % config.disaster_patience == 0
+            if state.best.genome != local_center:
+                local_center = state.best.genome
+                local = list(point_edits(local_center, pools))
             for island, (size, representatives) in enumerate(zip(sizes, parents, strict=True)):
                 children = [
                     item.genome for item in representatives[: min(config.elite_count, size)]
                 ]
                 if migrate:
                     donors = parents[island - 1]
-                    quota = min(size, max(1, round(size * config.migrants_ratio)))
+                    quota = min(size - len(children), max(1, round(size * config.migrants_ratio)))
                     children.extend(
                         mutate(donor.genome, min(1.0, chance * 2))
-                        for donor in donors[: max(0, quota - min(len(children), quota))]
+                        for donor in donors[:quota]
                     )
                 if disaster:
                     children.extend(new_genome() for _ in range(min(size - len(children), max(1, size // 3))))
+                if chance and local:
+                    # 每代留一部分名额系统检查冠军的一刀微调，其余名额继续交叉和变异。
+                    slots = min(size - len(children), max(1, size // 3))
+                    offset = (generation - state.best_generation - 1) * sum(max(1, n // 3) for n in sizes)
+                    offset += sum(max(1, n // 3) for n in sizes[:island])
+                    children.extend(apply_point_edit(local_center, local[(offset + i) % len(local)]) for i in range(slots))
                 while len(children) < size:
                     first = tournament(representatives)
                     genome = first.genome
@@ -377,10 +397,16 @@ def optimize(
                 batches.append(children)
 
         unique = dict.fromkeys(genome for island in batches for genome in island)
-        evaluation = list(evaluator([full_genome(prefix, genome) for genome in unique]))
-        if len(evaluation) != len(unique):
+        # 只沿用上一代和历史冠军，空间随种群大小封顶，检查点也包含相同的信息。
+        facts = {}
+        if state is not None:
+            facts = {item.genome: item.evaluation for island in state.islands for item in island}
+            facts[state.best.genome] = state.best.evaluation
+        missing = [genome for genome in unique if genome not in facts]
+        evaluation = list(evaluator([full_genome(prefix, genome) for genome in missing])) if missing else []
+        if len(evaluation) != len(missing):
             raise ValueError("评估器返回数量与请求不匹配")
-        facts = dict(zip(unique, evaluation, strict=True))
+        facts.update(zip(missing, evaluation, strict=True))
         evaluated = tuple(
             tuple(Candidate(genome, facts[genome]) for genome in island) for island in batches
         )
@@ -394,9 +420,9 @@ def optimize(
             simulations=(state.simulations if state else 0) + sum(
                 len(item.samples) or 1 for item in evaluation
             ),
-            exact_duplicates=(state.exact_duplicates if state else 0) + config.population - len(unique),
+            exact_duplicates=(state.exact_duplicates if state else 0) + config.population - len(missing),
             behavior_duplicates=(state.behavior_duplicates if state else 0) + behavior_duplicates,
-            observed=sum(item.fingerprint is not None for item in evaluation),
+            observed=sum(facts[genome].fingerprint is not None for genome in unique),
         )
         if config.stagnation_limit > 0 and state.generation - state.best_generation >= config.stagnation_limit:
             state = replace(state, stopped_early=True)

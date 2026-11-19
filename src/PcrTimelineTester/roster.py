@@ -3,9 +3,7 @@
 设计要点：
 
 * 队伍固定 5 人（摸轴器的公会战接口只吃 5 人），不再有迭代/温度这类参数；
-* 角色可以分组（A 组至少 2 人、B 组 1 人……），剩下的名额从未分组的人里补齐；
-  组员只在组内换，未分组的人只在未分组里换，这样「A 组两个人 + B 组一个人 + 未分组两个人」
-  的所有排列都会被枚举到；
+* 分组约束队内最少人数，同一角色可以满足多个组，剩余名额从整个候选池选；
 * 每支队伍都把「每个人 AUTO / SET」的 2^n 种组合各打一场（`:class:`TeamEvaluator`），
   取伤害最高的那种作为这支队的分，并记下每人的操作；
 * 中途取消不导出结果，靠 ``state.json`` 里的 cursor 续跑。
@@ -24,7 +22,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import httpx
 
-from .client import TuneError, simulation_url
+from .client import TuneError, _expected_damage, simulation_url
 from .datas import unit_width
 from .savefile import SaveFile
 
@@ -115,17 +113,6 @@ class RosterSettings:
         names = [group.name for group in groups]
         if len(set(names)) != len(names):
             raise ValueError("分组名不能重复")
-        members: list[int] = []
-        for group in groups:
-            for unit in group.members:
-                if unit not in pool:
-                    raise ValueError(f"分组 {group.name} 里的角色 {unit} 不在候选池里")
-            members.extend(group.members)
-        if len(set(members)) != len(members):
-            raise ValueError("同一个角色不能出现在两个分组里")
-        quota = sum(group.minimum for group in groups if group.used)
-        if quota > TEAM_SIZE:
-            raise ValueError(f"各分组的最少人数加起来是 {quota}，超过了 {TEAM_SIZE} 人")
         object.__setattr__(self, "groups", groups)
 
     # -------------------------------------------------------- 派生
@@ -177,11 +164,11 @@ class RosterSettings:
 
 # ---------------------------------------------------------------- 枚举
 def fixed_groups(settings: RosterSettings) -> tuple[GroupSpec, ...]:
-    """真正参与配额的分组：设了最少人数，且和候选池有交集。"""
+    """真正参与配额的分组：设了最少人数，包括候选池暂时无法满足的分组。"""
     return tuple(
         group
         for group in settings.groups
-        if group.used and group_members(settings, group)
+        if group.used
     )
 
 
@@ -207,58 +194,57 @@ def team_quota(settings: RosterSettings) -> int:
     return sum(group.minimum for group in fixed_groups(settings))
 
 
+def _allocations(settings: RosterSettings):
+    """按相同的分组归属归类，枚举各类人数；计数与实际组队使用同一套约束。"""
+    groups = fixed_groups(settings)
+    memberships = [set(group.members) for group in groups]
+    buckets = {}
+    for unit in settings.pool:
+        key = tuple(i for i, group in enumerate(memberships) if unit in group)
+        buckets.setdefault(key, []).append(unit)
+    # 先分配跨组角色，后面无法满足的配额可以提前剪掉。
+    ordered = sorted(buckets.items(), key=lambda item: -len(item[0]))
+    remaining = [sum(unit in group for unit in settings.pool) for group in memberships]
+
+    def visit(i, seats, needs, available, chosen):
+        if any(need > seats or need > avail for need, avail in zip(needs, available)):
+            return
+        if seats == 0:
+            yield chosen
+            return
+        if i == len(ordered):
+            return
+        covered, units = ordered[i]
+        after = list(available)
+        for j in covered:
+            after[j] -= len(units)
+        for n in range(min(seats, len(units)) + 1):
+            rest = list(needs)
+            for j in covered:
+                rest[j] = max(0, rest[j] - n)
+            part = ((units, n),) if n else ()
+            yield from visit(i + 1, seats - n, rest, after, chosen + part)
+
+    yield from visit(0, TEAM_SIZE, [group.minimum for group in groups], remaining, ())
+
+
 def team_count(settings: RosterSettings) -> int:
-    """一共要打多少支队伍（每支队伍再乘 32 种 AUTO/SET）。"""
-    return sum(1 for _ in iter_teams(settings))
-
-
-def _group_pools(settings: RosterSettings) -> list[list[tuple[int, ...]]]:
-    pools: list[list[tuple[int, ...]]] = []
-    for group in fixed_groups(settings):
-        members = group_members(settings, group)
-        if len(members) < group.minimum:
-            pools.append([])
-            continue
-        pools.append([tuple(part) for part in itertools.combinations(members, group.minimum)])
-    return pools
+    return sum(math.prod(math.comb(len(units), n) for units, n in allocation)
+               for allocation in _allocations(settings))
 
 
 def iter_teams(settings: RosterSettings) -> Iterator[tuple[int, ...]]:
-    """枚举所有 5 人队。
+    """逐支生成，避免为大候选池预先保存组合列表。"""
+    def expand(allocation, i, picked):
+        if i == len(allocation):
+            yield picked
+            return
+        units, n = allocation[i]
+        for part in itertools.combinations(units, n):
+            yield from expand(allocation, i + 1, picked + part)
 
-    规则（按需求）：
-    - 分组只看「设了最少人数」的组；组里同时也在候选池里的角色才算这个组的人。
-    - 每个组先抽够自己的最少人数。
-    - 候选池里不属于任何分组的角色用来补满剩下的座位。
-    - 分组之间允许重叠；抽出来的人重复（同一个角色上两次）或整队重复的排列会被跳过，
-      其余排列全部跑一遍。
-    """
-    quotas = fixed_groups(settings)
-    quota = team_quota(settings)
-    rest = TEAM_SIZE - quota
-    if rest < 0:
-        return
-    pools = _group_pools(settings)
-    if any(not pool for pool in pools):
-        return
-    free = ungrouped(settings)
-    if len(free) < rest:
-        return
-    extra_pool = list(itertools.combinations(free, rest))
-    seen: set[frozenset[int]] = set()
-    for chosen in itertools.product(*pools) if pools else [()]:
-        used: list[int] = [unit for part in chosen for unit in part]
-        if len(set(used)) != len(used):
-            continue  # 组之间抽到了同一个角色：这个排列不成立
-        for extra in extra_pool:
-            team = tuple(used) + tuple(extra)
-            if len(set(team)) != TEAM_SIZE:
-                continue
-            key = frozenset(team)
-            if key in seen:
-                continue
-            seen.add(key)
-            yield team
+    for allocation in _allocations(settings):
+        yield from expand(allocation, 0, ())
 
 
 # ---------------------------------------------------------------- 评估
@@ -365,6 +351,8 @@ class TeamEvaluator:
         self.battles = 0
         self._client = httpx.Client(timeout=float(settings.timeout))
         self._template = [dict(player) for player in save.players]
+        self._context = save.request_context(battle_time=int(settings.battle_time), battle_seed=int(settings.seed))
+        self.expected_damage = True
 
     # -------------------------------------------------------- 出口
     def close(self) -> None:
@@ -412,10 +400,8 @@ class TeamEvaluator:
         # 这样「第 K 位是 O」就真的是那个站位的角色 SET。
         order = lineup_order(tuple(int(unit) for unit in units))
         flags = tuple(_flag_of(units, toggles, unit) for unit in order)
-        body = self.save.request_context(
-            battle_time=int(self.settings.battle_time),
-            battle_seed=int(self.settings.seed if seed is None else seed),
-        )
+        body = dict(self._context)
+        body["Settings"] = {**self._context["Settings"], "RandomSeed": int(self.settings.seed if seed is None else seed)}
         body.update(
             PlayerList=self.team_players(order),
             CalcStats=1,
@@ -431,7 +417,7 @@ class TeamEvaluator:
             IsAutoMode=any(not bool(flag) for flag in flags),
             IsSetMode=False,
             SetToggles=[bool(flag) for flag in flags],
-            NeedOnceResult=False,
+            NeedOnceResult=self.expected_damage,
         )
         return body
 
@@ -489,7 +475,7 @@ class TeamEvaluator:
             raise ValueError(f"队伍必须是 {TEAM_SIZE} 个人（现在是 {len(team)} 个）")
         if len(set(team)) != len(team):
             raise ValueError("同一支队伍里不能有重复角色")
-        combos = self.combos(TEAM_SIZE)
+        combos = list(itertools.product((False, True), repeat=TEAM_SIZE))
         seeds = self.settings.seeds()
         requests: list[dict] = []
         for combo in combos:
@@ -561,8 +547,11 @@ class TeamEvaluator:
         stats = item.get("Stats")
         if not isinstance(stats, dict) or "TotalDamage" not in stats:
             raise TuneError("接口回包里没有 Stats.TotalDamage")
+        damage = _expected_damage(item) if self.expected_damage else None
+        if damage is None:
+            damage = float(stats["TotalDamage"])
         return {
-            "damage": int(round(float(stats["TotalDamage"]))),
+            "damage": int(round(damage)),
             "frames": int(item.get("BattleFrames") or 0),
             "result": int(item.get("Result") if item.get("Result") is not None else -1),
             "seed": seed,
@@ -631,6 +620,7 @@ class RosterJob:
         self._evaluator = evaluator
         self._cancel = cancel
         self.teams_total = team_count(settings)
+        self.expected_damage = True
         self.teams_done = 0
         self.battles_done = 0
         self.battle_seconds = 0.0
@@ -650,6 +640,7 @@ class RosterJob:
     def evaluator(self) -> TeamEvaluator:
         if self._evaluator is None:
             self._evaluator = TeamEvaluator(self.save, self.settings, log=self.log)
+            self._evaluator.expected_damage = self.expected_damage
         return self._evaluator
 
     @property
@@ -684,7 +675,7 @@ class RosterJob:
         seeds = max(1, int(self.settings.samples))
         per_team = max(1, combos * seeds)
         room = max(1, int(self.settings.batch_size)) * max(1, POST_WORKERS)
-        return max(1, min(room // per_team, POST_WORKERS * 2))
+        return max(1, math.ceil(room / per_team))
 
     def run(self) -> dict:
         started = time.time()
@@ -699,7 +690,8 @@ class RosterJob:
         free = ungrouped(self.settings)
         self.log(f"未分组 {len(free)} 人：{','.join(str(unit) for unit in free)}")
 
-        if all(unit in self.settings.pool for unit in self.save.unit_ids) and len(self.save.unit_ids) == TEAM_SIZE:
+        if (self.reference is None and len(self.save.unit_ids) == TEAM_SIZE
+                and all(unit in self.settings.pool for unit in self.save.unit_ids)):
             try:
                 self.reference = self.evaluator.evaluate([self.save.unit_ids])[0]
                 self.battles_done += combos * seeds
@@ -762,17 +754,22 @@ class RosterJob:
 
     def _run_chunk(self, teams: list[tuple[int, ...]]) -> None:
         began = time.time()
-        scores = self.evaluator.evaluate(teams)
+        # 原始顺序也必须一致，才能在并列最高伤害时沿用同一组 O/X。
+        reference_team = tuple(self.save.unit_ids) if self.reference is not None else ()
+        pending = [team for team in teams if team != reference_team]
+        fresh = iter(self.evaluator.evaluate(pending) if pending else ())
+        scores = [self.reference if team == reference_team else next(fresh) for team in teams]
         spent = time.time() - began
         combos = len(self.evaluator.combos(TEAM_SIZE))
         seeds = max(1, int(self.settings.samples))
-        self.battles_done += len(teams) * combos * seeds
+        actual_battles = len(pending) * combos * seeds
+        self.battles_done += actual_battles
         self.battle_seconds += spent
         self.chunks += 1
         if self.chunks <= 3 or spent >= 2.0:
             total = time.time() - (self._started or began)
             self.log(
-                f"第 {self.chunks} 批 {len(teams)} 支队伍 / {len(teams) * combos * seeds} 场"
+                f"第 {self.chunks} 批 {len(teams)} 支队伍 / {actual_battles} 场"
                 f"用了 {spent:.2f} 秒（累计 {total:.1f} 秒）"
             )
         for team, score in zip(teams, scores):
@@ -851,6 +848,9 @@ class RosterJob:
         return {
             "mode": "roster",
             "cursor": int(self.teams_done),
+            "enumeration_version": 2,
+            "expected_damage": self.expected_damage,
+            "teams": list(self.results),
             "battles": int(self.battles_done),
             "best_team": list(self.best_team or ()),
             "best_score": self.best_score.to_dict() if self.best_score else None,
@@ -859,6 +859,11 @@ class RosterJob:
         }
 
     def apply_state(self, data: dict) -> None:
+        if fixed_groups(self.settings) and data.get("enumeration_version") != 2:
+            self.log("旧版分组进度使用了不同的枚举顺序，本次将重新遍历符合最少人数的队伍。")
+            return
+        self.expected_damage = bool(data.get("expected_damage", False))
+        self.results = list(data.get("teams", ()))[:RESULT_LIMIT]
         self.teams_done = int(data.get("cursor") or 0)
         self.battles_done = int(data.get("battles") or 0)
         team = data.get("best_team") or []
@@ -867,6 +872,8 @@ class RosterJob:
         score = data.get("best_score")
         if isinstance(score, dict):
             self.best_score = TeamScore.from_dict(score)
+            if self.best_team and not self.results:
+                self._remember(self.best_team, self.best_score)
         reference = data.get("reference")
         if isinstance(reference, dict):
             self.reference = TeamScore.from_dict(reference)

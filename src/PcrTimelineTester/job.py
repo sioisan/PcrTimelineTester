@@ -18,9 +18,10 @@ import time
 from typing import Callable
 
 from .client import DEFAULT_CALC_STATS, DEFAULT_ENDPOINT, BattleOutcome, SimulatorClient, result_name
+from .effects import paired_alternates, proposals
 from .frames import FrameTarget, base_frame, build_targets, text
 from .savefile import FrameAxis, SaveFile
-from .search import MetricBook, SearchResult, SearchSettings, fmt, run as search_run, signed
+from .search import UB_MISS_LIMIT, MetricBook, SearchResult, SearchSettings, fmt, run as search_run, signed
 
 DECISION_TEXT = {
     "write": "写回",
@@ -126,6 +127,11 @@ class TuneJob:
         self.done: set[tuple[int, str]] = set()
         self.passes = max(1, int(settings.passes))
         self.pass_index = 0
+        self.effect_done: set[str] = set()
+        self.alternate_frames: dict[str, list[int]] = {}
+        self.effect_spent: dict[str, int] = {}
+        self.effect_progress: dict = {}
+        self._probe_books: dict[str, MetricBook] = {}
         self.baseline: BattleOutcome | None = None
         self.baseline_metric = 0.0
         self.current_metric = 0.0
@@ -246,7 +252,10 @@ class TuneJob:
                     f"当前期望伤害 {fmt(self.current_metric)} ==="
                 )
         if not self.cancelled:
+            self._refine_effects()
+        if not self.cancelled:
             self._verify()
+            self.cancelled = self._cancel.is_set()
         elapsed = time.monotonic() - self._started
         self.log(
             f"=== {'已中断：未写回任何最优解（存档保持原样）' if self.cancelled else '全部完成'}："
@@ -254,6 +263,116 @@ class TuneJob:
             f"{self.client.battles if self._client else 0} 场 / 用时 {elapsed:.1f}s ==="
         )
         return self.summary(elapsed)
+
+    def _refine_effects(self) -> None:
+        settings = self.search_settings
+        targets = [t for t in self.targets if t.row < len(self.save.unit_ids) and t.key not in self.effect_done]
+        events = None
+        if targets:
+            self.log("开始按跳伤、TP 与增减益生效帧调刀，测试队友联动和同帧顺序。")
+        while targets:
+            if self._cancel.is_set():
+                self.cancelled = True
+                return
+            targets.sort(key=lambda t: (self.frame_of(t), t.row, t.index))
+            target = targets.pop(0)
+            if not self.effect_progress and settings.max_battles and self.effect_spent.get(target.key, 0) >= settings.max_battles:
+                self.effect_done.add(target.key)
+                continue
+            if events is None:
+                trace = getattr(self.client, "effect_frames", None)
+                events = trace(self.frames) if trace else [set() for _ in self.save.unit_ids]
+            partner = next((t for t in targets if t.row != target.row
+                            and self.frame_of(t) - self.frame_of(target) <= max(60, 2 * settings.max_offset)), None)
+            changes = list(proposals(self.frames, target, partner, events, settings))
+            # 前面单改接近峰值的帧，也可能改变后面另一位队友的回能或技能循环。
+            later = [t for t in targets if t != partner and t.row != target.row
+                     and self.frame_of(t) - self.frame_of(target) <= max(600, 2 * settings.max_offset)
+                     and self.alternate_frames.get(t.key)]
+            for other in dict.fromkeys(later[:1] + later[-1:]):
+                changes.extend(paired_alternates(self.frames, target, other, self.alternate_frames, settings))
+            changes = list(dict.fromkeys(changes))
+            began = time.monotonic()
+            before_battles = self.battles
+            best = self._probe_effects(changes)
+            if self.cancelled:
+                return
+            if best is not None:
+                edits, metric = best
+                old_metric = self.current_metric
+                details = []
+                for t, value in edits:
+                    old = self.frames[t.row][t.index]
+                    details.append(f"{t.label} {text(old)}→{text(value)}")
+                    self.accepted.append(Accepted(t.row, t.index, t.label, old, value,
+                                                  self.current_metric, metric, self.passes))
+                    self.frames[t.row][t.index] = value
+                    self.current_metric = metric  # 同一笔联动收益只记一次
+                self.items.append({
+                    "label": "、".join(t.label for t, _ in edits), "pass": self.passes,
+                    "old_frame": "、".join(text(a.old_raw) for a in self.accepted[-len(edits):]),
+                    "new_frame": "、".join(text(value) for _, value in edits),
+                    "decision": "write", "decision_text": "效果帧联调",
+                    "baseline_metric": old_metric, "peak_metric": metric,
+                    "battles": self.battles - before_battles,
+                    "elapsed_ms": round((time.monotonic() - began) * 1000),
+                })
+                self.last_best_metric = metric
+                self.written += len(edits)
+                self.log(f"效果帧联调：{'、'.join(details)}，整刀 +{fmt(metric - old_metric)}")
+                events = None
+            self.effect_progress.clear()
+            self.effect_done.add(target.key)
+
+    def _probe_effects(self, changes):
+        """按批测试同一份轴上的候选，停止后从下一组继续。"""
+        settings = self.search_settings
+        progress = self.effect_progress
+        misses = progress.setdefault("misses", {})
+        index = progress.get("next", 0)
+        best = progress.get("best")
+        metric = progress.get("metric", max(self.current_metric, self.last_best_metric))
+        miss_limit = min(UB_MISS_LIMIT, settings.outer_probes)
+        while index < len(changes):
+            if self._cancel.is_set():
+                self.cancelled = True
+                return None
+            indices, axes = [], []
+            downward = {}
+            while index < len(changes) and len(axes) < settings.chunk:
+                edits = changes[index]
+                lower = [t.key for t, value in edits if base_frame(value) < self.frame_of(t)]
+                if any(misses.get(key, 0) > miss_limit for key in lower) or any(
+                    settings.max_battles and self.effect_spent.get(t.key, 0) >= settings.max_battles
+                    for t, _ in edits
+                ):
+                    index += 1
+                    continue
+                if any(misses.get(key, 0) + downward.get(key, 0) > miss_limit for key in lower):
+                    break  # 等本批实际 UB 帧回来，再决定能否继续向下探
+                axis = self.frames_copy()
+                for t, value in edits:
+                    axis[t.row][t.index] = value
+                    self.effect_spent[t.key] = self.effect_spent.get(t.key, 0) + 1
+                for key in lower:
+                    downward[key] = downward.get(key, 0) + 1
+                indices.append(index)
+                axes.append(axis)
+                index += 1
+            for i, outcome in zip(indices, self.client.evaluate(axes) if axes else (), strict=True):
+                fired = True
+                for t, value in changes[i]:
+                    if t.row >= len(outcome.ub_frames):
+                        continue
+                    row = outcome.ub_frames[t.row]
+                    hit = t.index < len(row) and base_frame(row[t.index]) == base_frame(value)
+                    if base_frame(value) < self.frame_of(t):
+                        misses[t.key] = 0 if hit else misses.get(t.key, 0) + 1
+                        fired = fired and hit
+                if fired and outcome.metric > metric:
+                    best, metric = i, outcome.metric
+            progress.update(next=index, best=best, metric=metric)
+        return (changes[best], metric) if best is not None else None
 
     def _establish_baseline(self) -> None:
         if self._resumed and self.baseline_metric:
@@ -296,6 +415,11 @@ class TuneJob:
             log=self.log,
             cancelled=self._cancel.is_set,
         )
+        if self.passes > 1 and self.search_settings.memoize:
+            previous = self._probe_books.get(target.key)
+            if previous is not None:
+                book.cache, book.ub = previous.cache, previous.ub
+            self._probe_books[target.key] = book
         # fetch 顺手把每个帧上「实际放出的 UB 帧」记进 book.ub，向下探时用来判断放不放得出来
         book.fetch = lambda frames, tag: self._fetch(target, frames, tag, book.ub)
         result = search_run(
@@ -311,6 +435,17 @@ class TuneJob:
             self.log(f"[warn] {target.label} 已取消，本轮到此为止（未写回任何改动）")
             return entry
         self.done.add((pass_no, target.key))
+        if pass_no == self.passes:
+            self.effect_spent[target.key] = result.battles
+            # 在峰值两侧各保留一个实测备选。伤害相同时选较远的帧，探索不同的配合。
+            alternatives = []
+            for side in (-1, 1):
+                candidates = [f for f in result.visited if (f - result.peak_frame) * side > 0]
+                if candidates:
+                    alternatives.append(max(candidates, key=lambda f: (result.visited[f], abs(f - result.peak_frame))))
+            self.alternate_frames[target.key] = alternatives
+            if not result.ok or result.peak_metric < self.last_best_metric:
+                self.effect_done.add(target.key)
         if not result.ok:
             self.failed += 1
             entry.update(decision="fail", decision_text=DECISION_TEXT["fail"])
@@ -347,6 +482,9 @@ class TuneJob:
         old_raw = float(self.frames[target.row][target.index])
         new_raw = target.to_raw(chosen)
         self.frames[target.row][target.index] = new_raw
+        if old_raw != new_raw and self._probe_books:
+            # 其他刀的探针依赖整条轴，这一刀自己的候选表仍可复用。
+            self._probe_books = {target.key: book}
         self.accepted.append(Accepted(
             row=target.row, index=target.index, label=target.label,
             old_raw=old_raw, new_raw=new_raw, old_metric=option_base, new_metric=result.peak_metric,
@@ -471,6 +609,10 @@ class TuneJob:
             "cancelled": self.cancelled,
             "pass_index": self.pass_index,
             "done": sorted([list(pair) for pair in self.done]),
+            "effect_done": sorted(self.effect_done),
+            "effect_spent": dict(self.effect_spent),
+            "alternate_frames": self.alternate_frames,
+            "effect_progress": dict(self.effect_progress),
             "accepted": [
                 {
                     "row": item.row, "index": item.index, "label": item.label,
@@ -506,6 +648,12 @@ class TuneJob:
             else:  # checkpoint from a single-pass run
                 done.add((1, str(entry)))
         self.done = done
+        self.effect_done = set(data.get("effect_done", ()))
+        self.alternate_frames = dict(data.get("alternate_frames", {}))
+        self.effect_spent = dict(data.get("effect_spent", {}))
+        self.effect_progress = dict(data.get("effect_progress", {}))
+        if self.search_settings.max_battles and "effect_spent" not in data:
+            self.effect_done.update(key for n, key in done if n == self.passes)
         self.pass_index = int(data.get("pass_index") or 1)
         self.baseline_metric = float(data.get("baseline_metric") or 0.0)
         self.current_metric = float(data.get("current_metric") or self.baseline_metric)

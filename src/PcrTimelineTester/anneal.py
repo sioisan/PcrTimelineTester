@@ -22,10 +22,12 @@ import time
 from .ga.engine import Candidate, Evaluation
 from .ga.job import GaJob
 from .ga.semantics import (
+    DEFAULT_MAX_LANE_LENGTH,
     EMPTY_GENOME,
     ROLE_COUNT,
     Genome,
     genome_from_rows,
+    point_neighbors,
 )
 from .ga.settings import GaSettings
 
@@ -273,6 +275,7 @@ def mutate(
     rng: random.Random,
     *,
     operator: str | None = None,
+    fixed_lengths: bool = False,
 ) -> tuple[Genome, str]:
     """生成一个邻居；返回 (新基因, 实际用到的算子名)。
 
@@ -289,11 +292,19 @@ def mutate(
         current = genome
         names: list[str] = []
         for _ in range(steps):
-            current, step_name = mutate(current, pools, single, rng, operator=operator)
+            current, step_name = mutate(current, pools, single, rng, operator=operator, fixed_lengths=fixed_lengths)
             names.append(step_name)
         return current, "+".join(dict.fromkeys(names))
     name = operator if operator in ops else _choose_weighted(rng, settings)
     filled = [role for role, lane in enumerate(lane_genome) if lane]
+    if name == "chain" and not fixed_lengths and (not filled or rng.random() < 0.45):
+        role = rng.randrange(ROLE_COUNT)
+        lane = lane_genome[role]
+        if lane and (len(lane) >= DEFAULT_MAX_LANE_LENGTH or rng.random() < 0.35):
+            lane.pop(rng.randrange(len(lane)))
+        elif pools[role]:
+            lane.insert(rng.randrange(len(lane) + 1), rng.choice(pools[role]))
+        return tuple(map(tuple, lane_genome)), name
     if not filled:
         return genome, name
 
@@ -301,16 +312,28 @@ def mutate(
         role = rng.choice(filled)
         index = rng.randrange(len(lane_genome[role]))
         pool = pools[role] if role < len(pools) and pools[role] else (lane_genome[role][index],)
-        lane_genome[role][index] = rng.choice(list(pool))
+        value = lane_genome[role][index]
+        # 同一类语义编码里微调一档，同时保留跨技能的大步探索。
+        if value in pool and len(pool) > 1 and rng.random() < 0.5:
+            at = pool.index(value)
+            adjacent = pool[max(0, at - 1):at] + pool[at + 1:at + 2]
+            lane_genome[role][index] = rng.choice(adjacent)
+        else:
+            lane_genome[role][index] = rng.choice(pool)
     elif name == "double":
         first = rng.choice(filled)
         second = rng.choice(filled)
         i = rng.randrange(len(lane_genome[first]))
         j = rng.randrange(len(lane_genome[second]))
-        lane_genome[first][i], lane_genome[second][j] = (
-            lane_genome[second][j],
-            lane_genome[first][i],
-        )
+        a, b = lane_genome[first][i], lane_genome[second][j]
+        if a != b and b in pools[first] and a in pools[second]:
+            lane_genome[first][i], lane_genome[second][j] = b, a
+        else:
+            for role, index in ((first, i), (second, j)):
+                value = lane_genome[role][index]
+                adjacent = [v for v in (value - 1, value + 1) if v in pools[role]]
+                if adjacent:
+                    lane_genome[role][index] = rng.choice(adjacent)
     elif name == "chain":
         role = rng.choice(filled)
         lane = lane_genome[role]
@@ -319,7 +342,7 @@ def mutate(
         start = rng.randint(0, max(0, len(lane) - length))
         pool = pools[role] if role < len(pools) and pools[role] else tuple(lane)
         for offset in range(length):
-            lane[start + offset] = rng.choice(list(pool))
+            lane[start + offset] = rng.choice(pool)
     else:  # manual：先等概率挑角色，再挑这一条里的某一刀
         role = rng.randrange(ROLE_COUNT) if len(lane_genome) >= ROLE_COUNT else rng.choice(filled)
         if not lane_genome[role]:
@@ -327,7 +350,7 @@ def mutate(
         lane = lane_genome[role]
         index = rng.randrange(len(lane))
         pool = pools[role] if role < len(pools) and pools[role] else (lane[index],)
-        lane[index] = rng.choice(list(pool))
+        lane[index] = rng.choice(pool)
     return tuple(tuple(lane) for lane in lane_genome), name
 
 
@@ -352,7 +375,7 @@ def temperature_at(settings: AnnealSettings, start: float, progress: float) -> f
     if progress <= 0:
         return start
     if progress >= 1:
-        return max(low, 1e-9) * start
+        return max(low, 1e-9)
     ratio = (max(low, 1e-9) / max(start, 1e-9)) ** min(1.0, progress)
     return max(1e-9, start * ratio)
 
@@ -370,6 +393,7 @@ def anneal(
     log=print,
     cancelled=lambda: False,
     resume: AnnealState | None = None,
+    fixed_lengths: bool = False,
 ) -> tuple[AnnealState, list[dict]]:
     """跑一次退火；返回 (最终状态, 日志行)。"""
     rng = random.Random(rng_seed)
@@ -390,31 +414,51 @@ def anneal(
         state = replace(state, best=best, best_iteration=0)
     best_score = best.evaluation.score(battle_time)
 
-    start_temperature = state.temperature or settings.initial_temperature
+    start_temperature = settings.initial_temperature
     total = int(settings.iterations)
     begin = int(state.iteration)
     if begin:
         log(f"续跑：从第 {begin}/{total} 次迭代继续（当前最优 {_fmt(best_score)}）")
 
-    for iteration in range(begin + 1, total + 1):
+    # 迭代预算按候选数计算，每批从同一当前解试几个邻居。
+    width = max(1, min(4, settings.batch_size // settings.samples))
+    iteration = begin
+    neighbors = iter(point_neighbors(best.genome, pools))
+    while iteration < total:
         if cancelled():
             raise AnnealCancelled()
+        count = min(width, total - iteration, settings.report_every - iteration % settings.report_every)
+        iteration += count
         progress = iteration / max(1, total)
         ratio = temperature_at(settings, start_temperature, progress)
         temperature = max(1e-9, ratio * (scale if scale_count else 1.0))
-        candidate, operator = mutate(current, pools, settings, rng)
-        if candidate in cache:
-            if not settings.allow_duplicates:
-                state = replace(state, iteration=iteration, exact_duplicates=state.exact_duplicates + 1)
+        proposals = {}
+        duplicates = 0
+        if settings.swap_chance > 0 and (count > 1 or iteration % 2 == 0):
+            for neighbor in neighbors:
+                if neighbor not in cache:
+                    proposals[neighbor] = "最优轴单刀微调"
+                    break
+        for _ in range(count * 4):
+            if len(proposals) == count:
+                break
+            candidate, operator = mutate(current, pools, settings, rng, fixed_lengths=fixed_lengths)
+            if candidate in proposals or (not settings.allow_duplicates and candidate in cache):
+                duplicates += 1
                 continue
-            candidate_eval = cache[candidate]
-        else:
-            results = evaluator.evaluate([full(prefix, candidate)])
-            if not results:
-                raise RuntimeError("退火评估没有返回结果")
-            candidate_eval = results[0]
-            cache[candidate] = candidate_eval
-            state = replace(state, simulations=state.simulations + 1)
+            proposals[candidate] = operator
+        missing = [genome for genome in proposals if genome not in cache]
+        if missing:
+            results = evaluator.evaluate([full(prefix, genome) for genome in missing])
+            if len(results) != len(missing):
+                raise RuntimeError("退火评估返回的候选数量与请求不符")
+            cache.update(zip(missing, results, strict=True))
+        state = replace(state, iteration=iteration, exact_duplicates=state.exact_duplicates + duplicates,
+                        simulations=state.simulations + len(missing) * settings.samples)
+        if not proposals:
+            continue
+        candidate = max(proposals, key=lambda genome: cache[genome].score(battle_time))
+        operator, candidate_eval = proposals[candidate], cache[candidate]
         candidate_score = candidate_eval.score(battle_time)
         best_previous = best_score
         delta = candidate_score - score
@@ -429,9 +473,10 @@ def anneal(
             if candidate_score > best_score:
                 best_score = candidate_score
                 best = Candidate(genome=candidate, evaluation=candidate_eval)
+                neighbors = iter(point_neighbors(best.genome, pools))
                 log(
                     f"第 {iteration} 次迭代：{_fmt(candidate_score)}（{operator} 换来的新高，"
-                    f"相对基线 {_signed(candidate_eval.damage - baseline.damage)}）"
+                    f"相对基线 {_signed(candidate_eval.mean_damage - baseline.mean_damage)}）"
                 )
         else:
             state = replace(state, rejected=state.rejected + 1)
@@ -446,15 +491,15 @@ def anneal(
             entry = {
                 "iteration": iteration,
                 "temperature": temperature,
-                "current": current_eval.damage,
-                "best": best.evaluation.damage,
+                "current": current_eval.mean_damage,
+                "best": best.evaluation.mean_damage,
                 "score": best_score,
                 "simulations": state.simulations,
             }
             history.append(entry)
             log(
-                f"[{iteration}/{total}] T={_fmt(temperature)} 当前 {current_eval.damage:,} "
-                f"最优 {best.evaluation.damage:,} 未接受 {state.rejected}"
+                f"[{iteration}/{total}] T={_fmt(temperature)} 当前 {current_eval.mean_damage:,} "
+                f"最优 {best.evaluation.mean_damage:,} 未接受 {state.rejected}"
             )
     return replace(state, best=best), history
 
@@ -570,16 +615,17 @@ class AnnealJob:
         best_state: AnnealState | None = None
         planned = max(1, int(self.settings.restarts))
         unlimited = int(self.settings.restarts) == 0
-        rounds = planned
         stale_rounds = 0
-        for index in range(1, rounds + 1):
+        index = 0
+        while unlimited or index < planned:
+            index += 1
             if self.cancelled_requested:
                 raise AnnealCancelled()
             resume = self.state if index == 1 else None
             seed = int(self.settings.seed) + index - 1
             if planned > 1 or unlimited:
                 self.log(
-                    f"--- 第 {index}{' 轮' if unlimited else f'/{rounds} 轮'}：随机种子 {seed}，"
+                    f"--- 第 {index}{' 轮' if unlimited else f'/{planned} 轮'}：随机种子 {seed}，"
                     f"{'从检查点继续' if resume else '重新起跑'} ---"
                 )
             state, history = anneal(
@@ -594,6 +640,7 @@ class AnnealJob:
                 log=self.log,
                 cancelled=lambda: self.cancelled_requested,
                 resume=resume,
+                fixed_lengths=prepared.roles is not None,
             )
             self.history.extend(history)
             score = state.best.evaluation.score(float(self.settings.battle_time)) if state.best else float("-inf")
@@ -603,7 +650,7 @@ class AnnealJob:
                     seed=seed,
                     iterations=int(state.iteration),
                     best_iteration=int(state.best_iteration),
-                    damage=int(state.best.evaluation.damage) if state.best else 0,
+                    damage=round(state.best.evaluation.mean_damage) if state.best else 0,
                     score=float(score),
                     simulations=int(state.simulations),
                 )
@@ -623,21 +670,17 @@ class AnnealJob:
             if unlimited and stale_rounds >= 3:
                 self.log(f"连续 {stale_rounds} 轮没有刷新最优，停止重启（共跑 {index} 轮）")
                 break
-            if unlimited and rounds - index <= 1:
-                rounds = index + 1
         self.state = best_state or self.state
 
         best_lanes = full(prepared.prefix, self.state.best.genome) if self.state and self.state.best else prepared.seed_lanes
         replay_eval, frames = self.evaluator.replay(best_lanes, prepared.roles)
-        self.log(f"导出前 replay：期望伤害 {replay_eval.damage:,} × 战斗帧 {replay_eval.frames}")
-        sequence = None
-        if self.settings.ga_equivalent().conversion_profile.sequence_type.name == "SEQUENCE" and prepared.roles:
-            sequence = prepared.roles
+        self.log(f"导出前复核：期望伤害 {replay_eval.mean_damage:,} × 战斗帧 {replay_eval.frames}")
+        sequence = prepared.roles
         self.export = {
             "lanes": [list(lane) for lane in best_lanes],
             "sequence": list(sequence) if sequence is not None else None,
             "frames": [list(row) for row in frames],
-            "damage": int(replay_eval.damage),
+            "damage": round(replay_eval.mean_damage),
             "frames_count": int(replay_eval.frames),
             "result": int(replay_eval.result),
             "ub_counts": list(replay_eval.ub_counts),
@@ -662,14 +705,10 @@ class AnnealJob:
         ))
 
     def _evaluate_initial(self, prepared):
-        results = self.evaluator.evaluate([prepared.seed_lanes])
-        if not results:
-            raise RuntimeError("退火起点评估没有返回结果")
-        baseline = results[0]
-        frames = [list(row) for row in baseline_frames(self.evaluator, prepared.seed_lanes, baseline)]
+        baseline, frames = self.evaluator.replay(prepared.seed_lanes, prepared.roles)
         prepared = replace(prepared, frames=frames)
         self.log(
-            f"=== 基线：期望伤害 {baseline.damage:,} × 战斗帧 {baseline.frames} / 结果 {baseline.result} ==="
+            f"=== 基线：期望伤害 {baseline.mean_damage:,} × 战斗帧 {baseline.frames} / 结果 {baseline.result} ==="
         )
         return prepared, baseline
 
@@ -694,9 +733,9 @@ class AnnealJob:
             "rejected": int(state.rejected) if state else 0,
             "restarts": int(self.settings.restarts),
             "rounds": [item.to_dict() for item in self.rounds],
-            "baseline": int(self.baseline.damage) if self.baseline else 0,
+            "baseline": round(self.baseline.mean_damage) if self.baseline else 0,
             "baseline_frames": int(self.baseline.frames) if self.baseline else 0,
-            "final": int(best.evaluation.damage) if best else 0,
+            "final": round(best.evaluation.mean_damage) if best else 0,
             "best_score": float(best.evaluation.score(float(self.settings.battle_time))) if best else 0.0,
             "history": list(self.history),
             "export": self.export,
@@ -710,6 +749,7 @@ class AnnealJob:
     def state_dict(self) -> dict:
         return {
             "mode": "anneal",
+            "expected_damage": self._ga.expected_damage,
             "prepared": None if self.prepared is None else self.prepared.to_dict(),
             "state": None if self.state is None else self.state.to_dict(),
             "history": list(self.history),
@@ -728,6 +768,7 @@ class AnnealJob:
     def apply_state(self, data: dict) -> None:
         from .ga.job import GaPrepared
 
+        self._ga.expected_damage = bool(data.get("expected_damage", False))
         prepared = data.get("prepared")
         if prepared:
             self.prepared = GaPrepared.from_dict(prepared)
@@ -764,14 +805,6 @@ class AnnealJob:
                 ub_counts=tuple(int(value) for value in baseline.get("ub_counts") or ()),
             )
         self.export = data.get("export")
-
-
-def baseline_frames(evaluator, lanes: Genome, evaluation: Evaluation) -> list[list[float]]:
-    """起点基因对应的帧轴（导出前要把它写回 save）。"""
-    try:
-        return evaluator.lanes_to_frames(lanes)
-    except Exception:  # pragma: no cover - 评估器不支持时退回空
-        return []
 
 
 def _signed(value: float) -> str:

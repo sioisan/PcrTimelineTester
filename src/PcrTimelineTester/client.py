@@ -274,5 +274,19 @@ class SimulatorClient:
             ))
         return outcomes
 
+    def effect_frames(self, frames: FrameAxis) -> list[set[int]]:
+        from .effects import effect_frames
+
+        seed = self.seeds[0]
+        request = self.request_for(frames, seed)
+        request["CalcStats"] = FULL_CALC_STATS
+        result = self._post([request])[0]
+        try:
+            self._outcome(result, seed, 1)
+        except _StatsMissing:
+            return [set() for _ in self.context["PlayerList"]]
+        units = [int(player["unitId"]) for player in self.context["PlayerList"]]
+        return effect_frames(result["Stats"], units)
+
     def evaluate_one(self, frames: FrameAxis) -> BattleOutcome:
         return self.evaluate([frames])[0]

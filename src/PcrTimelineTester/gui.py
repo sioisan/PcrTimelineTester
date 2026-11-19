@@ -21,6 +21,7 @@ import argparse
 import dataclasses
 import datetime
 import faulthandler
+import math
 import os
 from pathlib import Path
 import queue
@@ -30,11 +31,11 @@ import traceback
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from tkinter.scrolledtext import ScrolledText
+from tkinter import font as tkfont
 
 from . import modes as mode_registry
 from .client import DEFAULT_CALC_STATS
-from .datas import cached_icon
+from .character_grid import CharacterGrid
 from .frames import build_targets, text
 from .ga.semantics import (
     SemanSequenceType, SemanSkillType, SemanUBType,
@@ -70,7 +71,7 @@ def crash_log_path() -> Path:
 
 
 def _install_crash_handler() -> Path:
-    """任何没被捕获的异常都写进 crash.log，并弹窗告诉用户路径。"""
+    """任何没被捕获的异常都写进 crash.log；窗口还在就顺手写到界面日志。"""
     path = crash_log_path()
 
     def report(exc_type, exc, tb) -> None:
@@ -81,13 +82,14 @@ def _install_crash_handler() -> Path:
                 handle.writelines(traceback.format_exception(exc_type, exc, tb))
         except OSError:
             pass
-        try:
-            messagebox.showerror(
-                TITLE,
-                f"程序出错了：{exc_type.__name__}: {exc}\n\n详细信息写在：\n{path}",
-            )
-        except Exception:  # 连弹窗都开不了就别再抛了
-            pass
+        app = globals().get("_LAST_APP")
+        if app is not None:
+            try:
+                app._report_error(
+                    f"程序出错了：{exc_type.__name__}: {exc}（详细信息见 {path}）"
+                )
+            except Exception:  # 连日志都写不了就别再抛了
+                pass
 
     sys.excepthook = report
     try:
@@ -106,9 +108,55 @@ def _icon_dir_text() -> str:
     from .datas import icon_dir
 
     return str(icon_dir())
-CHECK_ON, CHECK_OFF = "[x]", "[  ]"
+CHECK_ON, CHECK_OFF = "√", "□"
 TITLE = "PcrTimelineTester"
 GEOMETRY_HINT = (1040, 620)
+
+# 工作区、面板和输入区使用不同明度，口径相同的颜色也用于非 ttk 控件。
+@dataclasses.dataclass(frozen=True)
+class Palette:
+    workspace: str
+    panel: str
+    field: str
+    header: str
+    text: str
+    muted: str
+    edge: str
+    violet: str
+    selection: str
+    cyan: str
+    tab: str
+    disabled: str
+    button: str
+    hover: str
+    pressed: str
+    heading: str
+    alternate: str
+    thumb: str
+    check_empty: str
+    primary: str
+    primary_ink: str
+
+DARK = Palette(
+    workspace="#0e0f1c", panel="#1b1b30", field="#121323",
+    header="#24203d", text="#f2f1fb", muted="#b5b4cb",
+    edge="#45415d", violet="#c0a2ff", selection="#493465",
+    cyan="#77e3d8", tab="#342847", disabled="#9591a7",
+    button="#302d45", hover="#413656", pressed="#46325d",
+    heading="#302a43", alternate="#212035", thumb="#565170",
+    check_empty="#1b1b30", primary="#bc91ff", primary_ink="#160c22",
+)
+
+LIGHT = Palette(
+    workspace="#eceef5", panel="#fafaff", field="#ffffff",
+    header="#e5e0f4", text="#232239", muted="#595970",
+    edge="#b9b7cb", violet="#6639a7", selection="#e2d5f9",
+    cyan="#147774", tab="#ede4fb", disabled="#6f6c7d",
+    button="#f0edf8", hover="#e4dcf2", pressed="#d9ccea",
+    heading="#e7e4ef", alternate="#f0eff7", thumb="#a29bb9",
+    check_empty="#fafaff", primary="#7145ad", primary_ink="#ffffff",
+)
+
 MODES = mode_registry.labels()
 
 UB_TYPE_LABELS = {
@@ -210,9 +258,9 @@ class Tooltip:
         tip = tk.Toplevel(self.widget)
         tip.wm_overrideredirect(True)
         tip.attributes("-topmost", True)
-        label = tk.Label(
-            tip, text=self.message, justify="left", background="#ffffe1",
-            relief="solid", borderwidth=1, wraplength=self.WRAP, padx=7, pady=5,
+        label = ttk.Label(
+            tip, text=self.message, justify="left", style="HeaderInfo.TLabel",
+            relief="solid", borderwidth=1, wraplength=self.WRAP, padding=(7, 5),
         )
         label.pack()
         tip.update_idletasks()
@@ -234,16 +282,208 @@ class Tooltip:
             self.tip = None
 
 
+def _control_styles(root, style, colors):
+    """保留 ttk 的鼠标和键盘操作，只替换控件的绘制元素。"""
+    tint, track, disabled = colors.selection, colors.field, colors.disabled
+    if "Workspace.indicator" not in style.element_names():
+        # PhotoImage 的生命周期要和窗口一样长，列表也供同一窗口的所有控件共用。
+        images = root.__dict__.setdefault("_control_images", [])
+
+        def image(width, height):
+            item = tk.PhotoImage(master=root, width=width, height=height)
+            images.append(item)
+            return item
+
+        unit = max(2, round(root.winfo_fpixels("1.5p")))
+        size = 7 * unit
+
+        def square(outline, fill, tick=None):
+            item = image(size + 3 * unit, size)
+            item.put(outline, to=(0, 0, size, size))
+            item.put(fill, to=(1, 1, size - 1, size - 1))
+            if tick:
+                for x in range(unit, size - unit):
+                    y = 5 * unit - abs(x - 5 * unit // 2)
+                    item.put(tick, to=(x, y, x + 1, y + unit))
+            return item
+
+        style.element_create("Workspace.indicator", "image", square(colors.muted, colors.check_empty),
+                             ("disabled", "selected", square(disabled, track, disabled)),
+                             ("disabled", square(disabled, track)),
+                             ("selected", square(colors.primary, colors.primary, colors.primary_ink)),
+                             ("focus", square(colors.violet, colors.check_empty)))
+
+        def tab_image(background, line):
+            item = image(96, 32 + unit)
+            item.put(background, to=(0, 0, 96, 32))
+            item.put(line, to=(0, 32, 96, 32 + unit))
+            return item
+
+        style.element_create("Workspace.tab", "image", tab_image(colors.panel, colors.panel),
+                             ("selected", "focus", tab_image(tint, colors.cyan)),
+                             ("selected", tab_image(colors.tab, colors.violet)),
+                             ("active", tab_image(track, track)), border=(0, 0, 0, unit), width=1, height=unit+1)
+
+        def chevron(color):
+            item = image(9 * unit, 5 * unit)
+            for x in range(4 * unit + 1):
+                y = unit + min(x, 4 * unit - x)
+                item.put(color, to=(2 * unit + x, y, 2 * unit + x + 1, y + unit))
+            return item
+
+        style.element_create("Workspace.downarrow", "image", chevron(colors.muted),
+                             ("disabled", chevron(disabled)), ("active", chevron(colors.violet)))
+
+        def thumb(color, vertical):
+            side = 7 * unit
+            width, height = (side, side + 48) if vertical else (side + 48, side)
+            item = image(width, height)
+            for y in range(unit, height - unit):
+                inset = max(0, 2 * unit - min(y, height - 1 - y))
+                item.put(color, to=(unit + inset, y, width - unit - inset, y + 1))
+            return item
+
+        for orient in ("Vertical", "Horizontal"):
+            vertical = orient == "Vertical"
+            style.element_create(f"{orient}.Workspace.thumb", "image", thumb(colors.thumb, vertical),
+                                 ("disabled", thumb(track, vertical)), ("pressed", thumb(colors.violet, vertical)),
+                                 ("active", thumb(colors.muted, vertical)), border=3 * unit,
+                                 width=7 * unit, height=7 * unit)
+
+        # 九宫格只拉伸中心，按钮宽度变化时圆角和焦点描边保持原尺寸。
+        radius = 3 * unit
+        def button_face(fill, outline):
+            # Tk 平铺中心区域。在 Windows 上逐像素平铺会产生数千次绘图调用。
+            side = 2 * radius + 50
+            item = image(side, side)
+            for y in range(side):
+                dy = max(0, radius - min(y, side - 1 - y))
+                inset = round(radius - (radius ** 2 - dy ** 2) ** 0.5)
+                item.put(outline, to=(inset, y, side - inset, y + 1))
+                if 0 < y < side - 1:
+                    item.put(fill, to=(inset + 1, y, side - inset - 1, y + 1))
+            return item
+
+        for name, fill, rim, hover, pressed in (
+            ("Workspace.button", colors.button, colors.edge, colors.hover, colors.pressed),
+            ("Workspace.primary", colors.primary, colors.violet, colors.primary, colors.primary),
+        ):
+            style.element_create(name, "image", button_face(fill, rim),
+                                 ("disabled", button_face(colors.panel, colors.edge)),
+                                 ("pressed", button_face(pressed, colors.violet)),
+                                 ("focus", button_face(fill, colors.cyan)),
+                                 ("active", button_face(hover, colors.violet)), border=radius + 1,
+                                 padding=2, width=2 * radius + 3, height=2 * radius + 3)
+
+    for name, face in (("TButton", "Workspace.button"), ("Primary.TButton", "Workspace.primary")):
+        style.layout(name, [(face, {"sticky": "nswe", "children": [
+            ("Button.padding", {"sticky": "nswe", "children": [("Button.label", {"sticky": "nswe"})]}),
+        ]})])
+
+    style.layout("TCheckbutton", [("Checkbutton.padding", {"sticky": "nswe", "children": [
+        ("Workspace.indicator", {"side": "left", "sticky": ""}),
+        ("Checkbutton.label", {"side": "left", "sticky": "w"}),
+    ]})])
+    style.map("TCheckbutton", background=[("!disabled", colors.panel), ("disabled", colors.panel)],
+              foreground=[("disabled", disabled), ("focus", colors.violet), ("active", colors.violet)])
+
+    style.layout("TNotebook.Tab", [("Workspace.tab", {"sticky": "nswe", "children": [
+        ("Notebook.padding", {"sticky": "nswe", "children": [("Notebook.label", {"sticky": ""})]}),
+    ]})])
+    style.configure("TNotebook.Tab", padding=(11, 5))
+    style.map("TNotebook.Tab", padding=[], foreground=[("disabled", disabled), ("selected", colors.violet),
+                                                      ("active", colors.text), ("!selected", colors.muted)])
+
+    style.layout("TCombobox", [("Entry.field", {"sticky": "nswe", "children": [
+        ("Workspace.downarrow", {"side": "right", "sticky": ""}),
+        ("Combobox.padding", {"sticky": "nswe", "children": [
+            ("Combobox.textarea", {"sticky": "nswe"}),
+        ]}),
+    ]})])
+    style.configure("TCombobox", padding=(5, 3), fieldbackground=colors.field, lightcolor=colors.field,
+                    darkcolor=colors.field, bordercolor=colors.edge)
+    style.map("TCombobox", fieldbackground=[("disabled", track), ("readonly", colors.field)],
+              foreground=[("disabled", disabled), ("readonly", colors.text)],
+              selectbackground=[("readonly", colors.field)], selectforeground=[("readonly", colors.text)],
+              bordercolor=[("focus", colors.violet), ("active", colors.muted)])
+    style.configure("ComboboxPopdownFrame", relief="flat", background=colors.edge)
+    for option, value in {"font": "TkDefaultFont", "background": colors.panel, "foreground": colors.text,
+                          "selectBackground": tint, "selectForeground": colors.violet,
+                          "selectBorderWidth": 0, "borderWidth": 0, "highlightThickness": 0}.items():
+        root.option_add(f"*TCombobox*Listbox.{option}", value)
+
+    for orient in ("Vertical", "Horizontal"):
+        name = f"{orient}.TScrollbar"
+        style.layout(name, [(f"{orient}.Scrollbar.trough", {"sticky": "nswe", "children": [
+            (f"{orient}.Workspace.thumb", {"sticky": "nswe"}),
+        ]})])
+        style.configure(name, troughcolor=track, bordercolor=track, troughborderwidth=0)
+
+
+def _workspace_theme(root: tk.Tk, colors: Palette) -> None:
+    style = ttk.Style(root)
+    name = "pcr-light" if colors is LIGHT else "pcr-dark"
+    if name not in style.theme_names():
+        style.theme_create(name, parent="clam")
+    style.theme_use(name)
+    font = tkfont.nametofont("TkDefaultFont", root=root)
+    if "Microsoft YaHei UI" in tkfont.families(root):
+        font.configure(family="Microsoft YaHei UI")
+    font.configure(size=max(10, font.actual("size")))
+    heading = (font.actual("family"), font.actual("size") + 2, "bold")
+    style.configure(".", background=colors.panel, foreground=colors.text, font=font, bordercolor=colors.edge,
+                    lightcolor=colors.panel, darkcolor=colors.panel, focuscolor=colors.violet,
+                    selectbackground=colors.selection, selectforeground=colors.text)
+    style.map(".", background=[("disabled", colors.panel), ("active", colors.header)],
+              foreground=[("disabled", colors.disabled)],
+              selectbackground=[("!focus", colors.selection)], selectforeground=[("!focus", colors.text)])
+    style.configure("Workspace.TFrame", background=colors.workspace)
+    style.configure("TPanedwindow", background=colors.workspace)
+    style.configure("Sash", gripcount=0, sashthickness=8)
+    style.configure("Header.TFrame", background=colors.header)
+    style.configure("Header.TLabel", font=(font.actual("family"), font.actual("size") + 4, "bold"),
+                    background=colors.header, foreground=colors.text)
+    style.configure("HeaderInfo.TLabel", background=colors.header, foreground=colors.muted)
+    style.configure("Title.TLabel", font=heading)
+    style.configure("Muted.TLabel", foreground=colors.muted)
+    style.configure("Status.TLabel", foreground=colors.muted, background=colors.workspace)
+    style.configure("TLabelframe", borderwidth=1, relief="solid")
+    style.configure("TLabelframe.Label", foreground=colors.violet)
+    style.configure("TButton", padding=(9, 4))
+    style.configure("Primary.TButton", padding=(18, 5))
+    style.map("Primary.TButton", foreground=[("disabled", colors.disabled), ("!disabled", colors.primary_ink)])
+    for field in ("TEntry", "TSpinbox"):
+        style.configure(field, fieldbackground=colors.field, padding=4, insertcolor=colors.text,
+                        arrowcolor=colors.muted, lightcolor=colors.field, darkcolor=colors.field)
+        style.map(field, bordercolor=[("focus", colors.violet)], lightcolor=[("focus", colors.field)],
+                  darkcolor=[("focus", colors.field)])
+    style.configure("TNotebook", background=colors.panel, borderwidth=0, tabmargins=0,
+                    bordercolor=colors.panel, lightcolor=colors.panel, darkcolor=colors.panel)
+    _control_styles(root, style, colors)
+    style.configure("Treeview", rowheight=font.metrics("linespace") + 10,
+                    background=colors.field, fieldbackground=colors.field, borderwidth=0)
+    style.configure("Treeview.Heading", background=colors.heading, foreground=colors.text,
+                    padding=(5, 5), relief="flat", lightcolor=colors.heading, darkcolor=colors.heading)
+    style.map("Treeview", background=[("selected", colors.selection)], foreground=[("selected", colors.text)])
+    style.configure("Horizontal.TProgressbar", background=colors.cyan, troughcolor=colors.field,
+                    borderwidth=0, lightcolor=colors.cyan, darkcolor=colors.cyan)
+    root.option_add("*Toplevel.background", colors.panel)
+    root.configure(background=colors.workspace)
+
+
 class App(ttk.Frame):
     """The whole window."""
 
     def __init__(self, master: tk.Tk, excel: Path | None = None) -> None:
-        super().__init__(master, padding=8)
+        saved = read_settings()
+        self.colors = LIGHT if saved.get("theme") == "light" else DARK
+        _workspace_theme(master, self.colors)
+        super().__init__(master, padding=12, style="Workspace.TFrame")
         self.master: tk.Tk = master
         self.grid(row=0, column=0, sticky="nsew")
         master.rowconfigure(0, weight=1)
         master.columnconfigure(0, weight=1)
-        self.rowconfigure(4, weight=1)
+        self.rowconfigure(1, weight=1)
         self.columnconfigure(0, weight=1)
 
         self.save: SaveFile | None = None
@@ -267,13 +507,18 @@ class App(ttk.Frame):
 
         self._make_vars()
         self._build_axis_row()
+        self.workspace = ttk.Panedwindow(self, orient="horizontal")
+        self.workspace.grid(row=1, column=0, sticky="nsew", pady=10)
         self._build_settings()
+        self.output = ttk.Notebook(self.workspace, width=520)
+        self.workspace.add(self.output, weight=3)
         self._build_items()
         self._build_actions()
         self._build_output()
 
+        self._sync_mode()
         self._set_running(False)
-        self._restore_settings()
+        self._restore_settings(saved)
         if excel is not None:
             self.open_axis(Path(excel))
         self._pump()
@@ -340,6 +585,10 @@ class App(ttk.Frame):
         self.anneal_restarts_var = tk.StringVar(value="1")
         self.report_every_var = tk.StringVar(value="25")
         self.anneal_delay_var = tk.StringVar(value="3")
+        # 0 押轴：只多一个「锁定站位」，其余复用「通用」页的战斗秒数/种子/采样/场次/超时/复核
+        self.zero_iterations_var = tk.StringVar(value="1200")
+        self.zero_batch_var = tk.StringVar(value="4")
+        self.zero_ub_limit_var = tk.StringVar(value="12")
         self.roster_pool_var = tk.StringVar(value="")
         self.to_max_attr_var = tk.BooleanVar(value=True)
         self.every_combo_var = tk.BooleanVar(value=True)
@@ -348,7 +597,7 @@ class App(ttk.Frame):
         self._icons: dict = {}
         self._icon_worker: threading.Thread | None = None
         self._icon_cancel = threading.Event()
-        self._icon_refresh = None
+        self._icon_refresh = set()
         self._icon_total = 0
         self.status_var = tk.StringVar(value="就绪")
 
@@ -357,92 +606,175 @@ class App(ttk.Frame):
         return widget
 
     def _build_axis_row(self) -> None:
-        frame = ttk.LabelFrame(self, text="轴文件", padding=6)
+        frame = ttk.Frame(self, padding=(16, 10), style="Header.TFrame")
         frame.grid(row=0, column=0, sticky="ew")
         frame.columnconfigure(1, weight=1)
-        label = ttk.Label(frame, text="PCRCalculator 导出的 .xlsx")
-        label.grid(row=0, column=0, sticky="w")
-        self._hint(label, "导入 PCRCalculator 导出的轴文件。基础数据页里的角色名会显示在可调项和报告里。")
-        entry = ttk.Entry(frame, textvariable=self.axis_var)
-        entry.grid(row=0, column=1, sticky="ew", padx=6)
-        self._hint(entry, "当前轴文件的完整路径（只读，用右边的按钮换一条）。")
-        button = ttk.Button(frame, text="打开轴…", command=self.ask_axis)
-        button.grid(row=0, column=2)
+        mark = tk.Canvas(frame, width=44, height=44, highlightthickness=0, background=self.colors.header)
+        self.header_mark = mark
+        mark.grid(row=0, column=0, rowspan=2, padx=(0, 12))
+        self.axis_title = tk.StringVar(value="公会战时间轴")
+        title = ttk.Label(frame, textvariable=self.axis_title, style="Header.TLabel")
+        title.grid(row=0, column=1, sticky="ew")
+        self.axis_tip = Tooltip(title, "选择 PCRCalculator 导出的 .xlsx 时间轴。")
+        self.axis_overview = tk.Canvas(frame, width=148, height=44, background=self.colors.header, highlightthickness=0)
+        self._hint(self.axis_overview, "五条横线依次对应五名角色，亮点表示原表中各次 UB 的计划帧。")
+        button = ttk.Button(frame, text="打开时间轴…", command=self.ask_axis)
+        button.grid(row=0, column=3, rowspan=2, padx=(12, 0))
         self._hint(button, "选择 PCRCalculator 导出的 .xlsx 轴文件。")
-        info = ttk.Label(frame, textvariable=self.axis_info, foreground="#345")
-        info.grid(row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
-        self._hint(info, "轴名、阵容、Boss、由轴名推断的战斗秒数和随机种子。")
+        info = ttk.Label(frame, textvariable=self.axis_info, style="HeaderInfo.TLabel")
+        info.grid(row=1, column=1, sticky="ew", pady=(4, 0))
+
+        # 文件栏底部的光带独立绘制，不占用文件名或队伍信息的宽度。
+        rail = tk.Canvas(frame, height=2, highlightthickness=0, background=self.colors.header)
+        rail.place(relx=0, rely=1, relwidth=1, anchor="sw", bordermode="outside")
+        def draw_rail(event):
+            rail.delete("all")
+            stops = ((63, 47, 88), (160, 111, 229), (100, 174, 183), (64, 56, 88))
+            for segment, (left, right) in enumerate(zip(stops, stops[1:])):
+                for step in range(16):
+                    color = "#%02x%02x%02x" % tuple(a + (b - a) * step // 16 for a, b in zip(left, right))
+                    x = (segment * 16 + step) * event.width // 48
+                    end = (segment * 16 + step + 1) * event.width // 48
+                    rail.create_rectangle(x, 0, end, 2, fill=color, outline="")
+        rail.bind("<Configure>", draw_rail)
+
+        def fit_header(event):
+            if event.width >= 960:
+                self.axis_overview.grid(row=0, column=2, rowspan=2, padx=(10, 0))
+            else:
+                self.axis_overview.grid_remove()
+            info.configure(wraplength=max(160, frame.grid_bbox(1, 1)[2]))
+
+        frame.bind("<Configure>", fit_header)
+        self._draw_axis_overview()
+
+    def _draw_axis_overview(self) -> None:
+        mark = self.header_mark
+        mark.configure(background=self.colors.header)
+        mark.delete("all")
+        mark.create_polygon(2, 11, 12, 2, 41, 2, 41, 31, 31, 41, 2, 41,
+                            fill=self.colors.tab, outline=self.colors.violet)
+        for y, shift, color in ((14, 0, self.colors.violet), (22, 5, self.colors.text), (30, 2, self.colors.cyan)):
+            mark.create_line(9, y, 34, y, fill=self.colors.edge, width=2)
+            mark.create_line(13 + shift, y, 20 + shift, y, fill=color, width=4)
+        chart = self.axis_overview
+        chart.configure(background=self.colors.header)
+        chart.delete("all")
+        for x in range(4, 146, 14):
+            chart.create_line(x, 3, x, 41, fill=self.colors.edge, dash=(2, 3))
+        lanes = self.save.frames[:5] if self.save else []
+        duration = self.save.suggested_duration(self.save.header) if self.save else 90
+        span = max(1, duration * 60, *(max(row, default=0) for row in lanes))
+        for i, color in enumerate((self.colors.violet, "#dac4ff", "#a997ff", "#7bb9dc", self.colors.cyan)):
+            y = 6 + i * 8
+            chart.create_line(4, y, 144, y, fill=self.colors.edge)
+            for frame in lanes[i] if i < len(lanes) else ():
+                x = 4 + 140 * frame / span
+                chart.create_line(x, y - 2, x, y + 3, fill=color, width=2)
 
     def _build_settings(self) -> None:
-        holder = ttk.Frame(self)
-        holder.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        holder = ttk.Frame(self.workspace, padding=(12, 10), width=460)
+        self.workspace.add(holder, weight=2)
+        holder.grid_propagate(False)
         holder.columnconfigure(0, weight=1)
-
-        server = ttk.LabelFrame(holder, text="摸轴器", padding=6)
-        server.grid(row=0, column=0, sticky="ew")
-        server.columnconfigure(1, weight=1)
-        server.columnconfigure(3, weight=1)
-        ttk.Label(server, text="PCRCalculator 目录").grid(row=0, column=0, sticky="w", pady=1)
-        calc_entry = ttk.Entry(server, textvariable=self.calculator_var)
-        calc_entry.grid(row=0, column=1, columnspan=3, sticky="ew", padx=(6, 6), pady=1)
-        self._hint(
-            calc_entry,
-            "PCRCalculator 所在的文件夹（解压出来的那个目录就行）。"
-            "可以直接指到 server 子目录，也可以直接选 PCRCalculatorServer.exe。",
-        )
-        browse = ttk.Button(server, text="浏览…", command=self.ask_calculator)
-        browse.grid(row=0, column=4, pady=1)
-        self._hint(browse, "选择 PCRCalculator 文件夹或它里面的 server 子目录。")
-
-        ttk.Label(server, text="端口").grid(row=1, column=0, sticky="w", pady=1)
-        port_entry = ttk.Entry(server, textvariable=self.port_var, width=8)
-        port_entry.grid(row=1, column=1, sticky="w", padx=(6, 16), pady=1)
-        self._hint(port_entry, "摸轴器监听的端口，默认 8080。端口被别的程序占了就换一个（1~65535）。")
-
-        ttk.Label(server, text="优化模式").grid(row=1, column=2, sticky="w", pady=1)
-        self.mode_box = ttk.Combobox(
-            server, textvariable=self.mode_var, width=12, state="readonly",
-            values=[label for _value, label in MODES],
-        )
-        self.mode_box.grid(row=1, column=3, sticky="w", padx=(6, 6), pady=1)
-        self.mode_box.bind("<<ComboboxSelected>>", lambda _event: self._sync_mode())
-        self._hint(
-            self.mode_box,
-            "逐帧搜索：一格一格挪 UB 帧，结果最可控。"
-            "语义 GA：用遗传算法整体搜索语义 UB 序列，适合整套轴一起优化。"
-            "两种模式的参数在下面各自的标签页里。",
-        )
-
-        autostart = ttk.Checkbutton(
-            server, text="开始调帧时自动启动摸轴器", variable=self.autostart_var,
-        )
-        autostart.grid(row=2, column=0, columnspan=5, sticky="w", pady=(2, 0))
-        self._hint(
-            autostart,
-            "勾上后点「开始调帧」会自动启动 PCRCalculatorServer.exe；"
-            "如果该端口已经有摸轴器在跑，就直接用那个，不会重复启动也不会关掉它。",
-        )
-
+        holder.rowconfigure(1, weight=1)
+        bar = ttk.Frame(holder)
+        bar.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        ttk.Label(bar, text="优化模式", style="Title.TLabel").pack(side="left")
+        self.mode_box = ttk.Combobox(bar, textvariable=self.mode_var, width=13, state="readonly",
+                                     values=[label for _, label in MODES])
+        self.mode_box.pack(side="right")
+        self.mode_box.bind("<<ComboboxSelected>>", lambda _: self._sync_mode())
         self.settings_tabs = ttk.Notebook(holder)
-        self.settings_tabs.grid(row=1, column=0, sticky="ew", pady=(8, 0))
-        self.tab_shared = ttk.Frame(self.settings_tabs, padding=8)
-        self.tab_frame = ttk.Frame(self.settings_tabs, padding=8)
-        self.tab_ga = ttk.Frame(self.settings_tabs, padding=8)
-        self.tab_anneal = ttk.Frame(self.settings_tabs, padding=8)
-        self.tab_roster = ttk.Frame(self.settings_tabs, padding=8)
-        self.settings_tabs.add(self.tab_shared, text="通用")
-        self.settings_tabs.add(self.tab_frame, text="逐帧搜索")
-        self.settings_tabs.add(self.tab_ga, text="语义 GA")
-        self.settings_tabs.add(self.tab_anneal, text="退火")
-        self.settings_tabs.add(self.tab_roster, text="阵容搜索")
-        for tab in (self.tab_shared, self.tab_frame, self.tab_ga, self.tab_anneal, self.tab_roster):
+        self.settings_tabs.grid(row=1, column=0, sticky="nsew")
+        self.tab_mode = ttk.Frame(self.settings_tabs)
+        self.tab_common = ttk.Frame(self.settings_tabs)
+        self.settings_tabs.add(self.tab_mode, text="模式参数")
+        self.settings_tabs.add(self.tab_common, text="通用设置")
+        self.scroll_views = {}
+        modes_area = self._scrollable_settings(self.tab_mode)
+        shared_area = self._scrollable_settings(self.tab_common)
+        server = ttk.LabelFrame(shared_area, text="摸轴器", padding=8)
+        server.grid(row=0, column=0, sticky="ew", pady=(0, 12))
+        server.columnconfigure(1, weight=1)
+        ttk.Label(server, text="算器目录").grid(row=0, column=0, sticky="w")
+        calc_entry = ttk.Entry(server, textvariable=self.calculator_var, width=12)
+        calc_entry.grid(row=0, column=1, sticky="ew", padx=6)
+        self._hint(calc_entry, "请选择 PCRCalculator 安装目录或其中的 server 目录。")
+        ttk.Button(server, text="浏览…", command=self.ask_calculator).grid(row=0, column=2)
+        ttk.Label(server, text="端口").grid(row=1, column=0, pady=5, sticky="w")
+        port_entry = ttk.Entry(server, textvariable=self.port_var, width=8)
+        port_entry.grid(row=1, column=1, sticky="w", padx=6)
+        self._hint(port_entry, "摸轴器监听端口，默认 8080。")
+        ttk.Checkbutton(server, text="开始搜索时自动启动摸轴器", variable=self.autostart_var).grid(
+            row=2, column=0, columnspan=3, sticky="w")
+        self.tab_shared = ttk.Frame(shared_area)
+        self.tab_shared.grid(row=1, column=0, sticky="ew")
+        self.mode_pages = {key: ttk.Frame(modes_area) for key, _ in MODES}
+        self.tab_frame = self.mode_pages["frame"]
+        self.tab_ga = self.mode_pages["ga"]
+        self.tab_anneal = self.mode_pages["anneal"]
+        self.tab_roster = self.mode_pages["roster"]
+        self.tab_zero = self.mode_pages["zero"]
+        for tab in (self.tab_shared, *self.mode_pages.values()):
             tab.columnconfigure(1, weight=1)
             tab.columnconfigure(3, weight=1)
+        cycle = self.mode_pages["cycle"]
+        self.cycle_vars = {}
+        for row, param in enumerate(mode_registry.CYCLE_PARAMS):
+            var = tk.StringVar(value=str(param.default))
+            self.cycle_vars[param.name] = var
+            ttk.Label(cycle, text=param.label).grid(row=row, column=0, sticky="w", pady=3)
+            entry = ttk.Entry(cycle, textvariable=var, width=10)
+            entry.grid(row=row, column=1, columnspan=3, sticky="ew", padx=(10, 0), pady=3)
+            self._hint(entry, param.tip)
+        note = ttk.Label(cycle, style="Muted.TLabel", justify="left", wraplength=300,
+                         text="循环搜索会根据 TP 到账和技能命中，尝试增减 UB 或重排队友的出手顺序。"
+                              "搜索层数决定能连续改几步，保留分支决定每层留下几种打法，每支候选决定每种打法试多少次。"
+                              "\n\n结果表保留整场期望伤害最高的轴。找到比原轴多开 UB 的打法时，还会另存多发分支。")
+        note.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(12, 0))
         self._build_shared(self.tab_shared)
         self._build_frame_tab(self.tab_frame)
         self._build_ga(self.tab_ga)
         self._build_anneal(self.tab_anneal)
         self._build_roster(self.tab_roster)
+        self._build_zero(self.tab_zero)
+        for tab in (self.tab_shared, *self.mode_pages.values()):
+            notes = [w for w in tab.winfo_children() if isinstance(w, ttk.Label)
+                     and w.cget("style") == "Muted.TLabel"]
+            for w in notes:
+                w.configure(wraplength=300, justify="left")
+                w.grid_configure(sticky="ew")
+            def wrap_notes(event, labels=notes):
+                width = max(150, event.width - 12)
+                for label in labels:
+                    if int(label.cget("wraplength")) != width:
+                        label.configure(wraplength=width)
+            tab.bind("<Configure>", wrap_notes)
+        self.master.bind("<MouseWheel>", self._scroll_settings, add="+")
+
+    def _scrollable_settings(self, tab):
+        tab.columnconfigure(0, weight=1)
+        tab.rowconfigure(0, weight=1)
+        view = tk.Canvas(tab, width=100, height=100, background=self.colors.panel, highlightthickness=0)
+        view.grid(row=0, column=0, sticky="nsew")
+        bar = ttk.Scrollbar(tab, orient="vertical", command=view.yview)
+        bar.grid(row=0, column=1, sticky="ns")
+        view.configure(yscrollcommand=bar.set)
+        body = ttk.Frame(view, padding=(3, 12, 5, 5))
+        body.columnconfigure(0, weight=1)
+        window = view.create_window(0, 0, anchor="nw", window=body)
+        view.bind("<Configure>", lambda e: view.itemconfigure(window, width=e.width))
+        body.bind("<Configure>", lambda _: view.configure(scrollregion=view.bbox("all")))
+        self.scroll_views[tab] = view
+        return body
+
+    def _scroll_settings(self, event):
+        for tab, view in self.scroll_views.items():
+            if str(event.widget).startswith(str(tab) + ".") and view.yview() != (0.0, 1.0):
+                if event.widget.winfo_class() not in ("Treeview", "TCombobox"):
+                    view.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                break
 
     def _build_shared(self, tab: ttk.Frame) -> None:
         """两种优化模式都要用的接口参数。"""
@@ -477,8 +809,8 @@ class App(ttk.Frame):
 
         note = ttk.Label(
             tab,
-            text="这一页的参数两种模式共用；逐帧搜索与语义 GA 自己的参数在各自标签页里。",
-            foreground="#666666",
+            text="战斗秒数和种子会在载入轴时自动填入，采样种子数大于 1 时按多场平均伤害比较。",
+            style="Muted.TLabel",
         )
         note.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -545,7 +877,7 @@ class App(ttk.Frame):
         note = ttk.Label(
             tab,
             text="这一页只在「逐帧搜索」模式生效；想整条轴一起优化，把上面的优化模式切到语义 GA。",
-            foreground="#666666",
+            style="Muted.TLabel",
         )
         note.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -626,20 +958,20 @@ class App(ttk.Frame):
         flags = ttk.Frame(ga)
         flags.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
         legacy = ttk.Checkbutton(flags, text="加入旧版 UB 候选", variable=self.legacy_ub_var)
-        legacy.pack(side="left")
+        legacy.grid(row=0, column=0, sticky="w")
         self._hint(legacy, "往基因池里加入旧版 UB 的编码，适合这条轴本来就混着旧版 UB 的情况。")
         own = ttk.Checkbutton(flags, text="加入本角色技能", variable=self.own_skill_var)
-        own.pack(side="left", padx=(10, 0))
+        own.grid(row=0, column=1, sticky="w", padx=6)
         self._hint(own, "让基因池包含本角色自己的技能段（一般都要开）。")
         other = ttk.Checkbutton(flags, text="加入其他角色技能", variable=self.other_skill_var)
-        other.pack(side="left", padx=(10, 0))
+        other.grid(row=1, column=0, sticky="w")
         self._hint(other, "把其他角色的技能段也放进池子，搜索面更大但更慢。")
         row += 1
 
         note = ttk.Label(
             ga,
-            text="这一页只在「语义 GA」模式生效；逐帧搜索的参数在「逐帧搜索」标签页里。",
-            foreground="#666666",
+            text="种群决定每代保留的候选数量。增加代数可以继续探索，增加岛屿可以同时尝试不同打法。",
+            style="Muted.TLabel",
         )
         note.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -680,7 +1012,7 @@ class App(ttk.Frame):
             row += 1
 
         allow = ttk.Checkbutton(
-            anneal, text="允许重复状态（不命中缓存）", variable=self.allow_duplicates_var,
+            anneal, text="允许重访已评估的状态", variable=self.allow_duplicates_var,
         )
         allow.grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self._hint(
@@ -692,7 +1024,7 @@ class App(ttk.Frame):
         note = ttk.Label(
             anneal,
             text="这一页只在「退火」模式生效；语义口径（UB/技能/序列类型）跟「语义 GA」那页共用。",
-            foreground="#666666",
+            style="Muted.TLabel",
         )
         note.grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
@@ -716,13 +1048,12 @@ class App(ttk.Frame):
         self.group_tree = ttk.Treeview(
             holder, columns=("name", "minimum", "members"), show="headings", height=5
         )
-        for column, heading, width in (
-            ("name", "分组", 90),
-            ("minimum", "最少人数", 70),
-            ("members", "成员", 420),
-        ):
+        font = tkfont.nametofont("TkDefaultFont", root=self.master)
+        for column, heading in (("name", "分组"), ("minimum", "最少人数"), ("members", "成员")):
+            minimum = font.measure(heading) + 22
             self.group_tree.heading(column, text=heading)
-            self.group_tree.column(column, width=width, anchor="w")
+            self.group_tree.column(column, width=max(minimum, 64), minwidth=minimum,
+                                   stretch=column == "members", anchor="center" if column == "minimum" else "w")
         scroll = ttk.Scrollbar(holder, orient="vertical", command=self.group_tree.yview)
         self.group_tree.configure(yscrollcommand=scroll.set)
         self.group_tree.grid(row=0, column=0, sticky="nsew")
@@ -730,26 +1061,26 @@ class App(ttk.Frame):
         self.group_tree.bind("<Double-1>", lambda _event: self.edit_group())
         self._hint(
             self.group_tree,
-            "每个分组先抽够「最少人数」，剩下的名额从未分组的角色里补；"
-            "最少人数填 0 等于没分组，成员回到未分组里一起抽。所有组合都会被排完。",
+            "只从候选池选人，各组可以超过最少人数；"
+            "跨组角色同时计入各组，最少人数填 0 表示不限。",
         )
 
         buttons = ttk.Frame(roster)
-        buttons.grid(row=2, column=1, columnspan=3, sticky="w", pady=(2, 6))
+        buttons.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(4, 6))
         new = ttk.Button(buttons, text="新建分组", command=self.new_group)
-        new.pack(side="left")
+        new.grid(row=0, column=0, padx=2, pady=2, sticky="ew")
         self._hint(new, "起个组名、填最少要上几个人，再从候选池里勾成员。")
         edit = ttk.Button(buttons, text="编辑", command=self.edit_group)
-        edit.pack(side="left", padx=(6, 0))
+        edit.grid(row=0, column=1, padx=2, pady=2, sticky="ew")
         self._hint(edit, "改选中分组的名字、最少人数和成员（双击一行也行）。")
         remove = ttk.Button(buttons, text="删除", command=self.delete_group)
-        remove.pack(side="left", padx=(6, 0))
+        remove.grid(row=0, column=2, padx=2, pady=2, sticky="ew")
         self._hint(remove, "把选中的分组删掉，成员回到未分组。")
         save = ttk.Button(buttons, text="保存预设…", command=self.save_preset)
-        save.pack(side="left", padx=(18, 0))
+        save.grid(row=1, column=0, padx=2, pady=2, sticky="ew")
         self._hint(save, "把候选角色和分组存成一份预设，下次可以一键载入。")
         load = ttk.Button(buttons, text="载入预设…", command=self.load_preset)
-        load.pack(side="left", padx=(6, 0))
+        load.grid(row=1, column=1, padx=2, pady=2, sticky="ew")
         self._hint(load, "载入之前保存的候选池与分组预设。")
 
         row = 3
@@ -759,7 +1090,7 @@ class App(ttk.Frame):
         combos = ttk.Checkbutton(roster, text="每队试 32 种 AUTO/SET", variable=self.every_combo_var)
         combos.grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
         self._hint(combos, "每支队伍都把「每个人 AUTO / SET」的 2^5 种组合各打一遍取最高；"
-                           "关掉只打全 AUTO（快 32 倍，但试不到 SET）。")
+                           "关掉只打全 SET（OOOOO）。")
         row += 1
         verify = ttk.Checkbutton(roster, text="跑完复核", variable=self.verify_var)
         verify.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
@@ -768,24 +1099,84 @@ class App(ttk.Frame):
         icon_row = ttk.Frame(roster)
         icon_row.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 0))
         pack_button = ttk.Button(icon_row, text="导入图标包…", command=self.import_icon_pack)
-        pack_button.pack(side="left")
+        pack_button.grid(row=0, column=0, sticky="w")
         self._hint(pack_button, "选一个 icon.zip，把里面的图标解压到本机缓存目录（随发布包附带一份）。")
         fetch = ttk.Button(icon_row, text="下载选中角色的图标", command=self.download_pool_icons)
-        fetch.pack(side="left", padx=(6, 6))
+        fetch.grid(row=0, column=1, sticky="w", padx=6)
         self._hint(fetch, "按候选池里的角色从 wthee.xyz 下载图标；后台多线程，界面不会卡。")
-        ttk.Button(buttons, text="查看结果…", command=self.show_roster_results).pack(side="left")
+        ttk.Button(buttons, text="查看结果…", command=self.show_roster_results).grid(
+            row=1, column=2, padx=2, pady=2, sticky="ew")
         self.icon_bar = ttk.Progressbar(icon_row, mode="determinate", length=180)
-        self.icon_bar.pack(side="left")
-        self.icon_status = ttk.Label(icon_row, text="图标缓存：%s" % _icon_dir_text())
-        self.icon_status.pack(side="left", padx=(8, 0))
+        self.icon_bar.grid(row=1, column=0, columnspan=2, sticky="ew", pady=4)
+        self.icon_status = ttk.Label(icon_row, text="图标缓存：%s" % _icon_dir_text(), wraplength=270, style="Muted.TLabel")
+        self.icon_status.grid(row=2, column=0, columnspan=2, sticky="w")
         row += 1
         note = ttk.Label(
             roster,
             text="这一页只在「阵容搜索」模式生效：队伍固定 5 人，所有队伍组合都会排完；"
-                 "每队再试「每个人 AUTO / SET」的组合取最高伤害，SET 的人按轴里的帧轴出手。",
-            foreground="#666666",
+                 "勾选「每队试 32 种组合」会比较全队的 AUTO / SET 搭配。",
+            style="Muted.TLabel",
         )
         note.grid(row=row, column=0, columnspan=4, sticky="w", pady=(6, 0))
+
+    def _build_zero(self, tab: ttk.Frame) -> None:
+        """0 押轴：整场不打手动 UB，退火逐刀决定每刀是 O（SET）还是 X（AUTO）。"""
+        zero = tab
+        zero.columnconfigure(1, weight=1)
+        zero.columnconfigure(3, weight=1)
+        ttk.Label(zero, text="退火轮数").grid(row=0, column=0, sticky="w", pady=1)
+        iterations = ttk.Entry(zero, textvariable=self.zero_iterations_var, width=10)
+        iterations.grid(row=0, column=1, sticky="w", padx=(6, 0), pady=1)
+        self._hint(iterations, "每轮同时提几个新方案、挑能接受的那个；1200 轮大约一两分钟，5000 轮更稳。")
+        ttk.Label(zero, text="每轮候选").grid(row=0, column=2, sticky="e", pady=1)
+        batch = ttk.Entry(zero, textvariable=self.zero_batch_var, width=10)
+        batch.grid(row=0, column=3, sticky="w", padx=(6, 0), pady=1)
+        self._hint(batch, "一轮里并行试几个方案（4 已经能喂满摸轴器，再大只是排队）。")
+        ttk.Label(zero, text="最多几刀").grid(row=1, column=0, sticky="w", pady=1)
+        limit = ttk.Entry(zero, textvariable=self.zero_ub_limit_var, width=10)
+        limit.grid(row=1, column=1, sticky="w", padx=(6, 0), pady=1)
+        self._hint(limit, "每个角色最多排到第几刀；更后面的刀沿用最后一刀的设定。")
+        note = ttk.Label(
+            zero,
+            text="这一页只在「0押轴」模式生效：整场不打手动 UB，同一角色的每一刀都可以单独选 O（SET，一有机会就按）"
+                 "或 X（AUTO，交给角色自己找时机），比如 1 号位 O X O O（之后都是 O）。退火会一步步试，越试越好。",
+            style="Muted.TLabel",
+            wraplength=760,
+            justify="left",
+        )
+        note.grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        edge = ttk.Label(
+            zero,
+            text="战斗秒数 / 种子 / 采样 / 超时 / 跑完复核 都在「通用」页里；起始温度与结束温度用默认值即可。",
+            style="Muted.TLabel",
+        )
+        edge.grid(row=3, column=0, columnspan=4, sticky="w", pady=(4, 0))
+
+    def _zero_settings(self):
+        from .zero import ZeroSettings
+
+        return ZeroSettings(
+            endpoint=endpoint_for(self._port()),
+            battle_time=self._number(self.battle_time_var, "战斗秒数", 1, 90),
+            seed=self._number(self.seed_var, "战斗种子", -(2 ** 31), 2 ** 31 - 1),
+            samples=self._number(self.samples_var, "采样种子数", 1, 100),
+            iterations=self._number(self.zero_iterations_var, "退火轮数", 1, 200000),
+            batch=self._number(self.zero_batch_var, "每轮候选", 1, 32),
+            ub_limit=self._number(self.zero_ub_limit_var, "最多几刀", 1, 24),
+            timeout=float(self._number(self.timeout_var, "超时秒", 1, 3600, integer=False)),
+            to_max_attr=bool(self.to_max_attr_var.get()),
+            verify=bool(self.verify_var.get()),
+        )
+
+    def _apply_zero_settings(self, settings) -> None:
+        self.zero_iterations_var.set(str(settings.iterations))
+        self.zero_batch_var.set(str(settings.batch))
+        self.zero_ub_limit_var.set(str(settings.ub_limit))
+        self.battle_time_var.set(str(settings.battle_time))
+        self.seed_var.set(str(settings.seed))
+        self.samples_var.set(str(settings.samples))
+        self.to_max_attr_var.set(bool(settings.to_max_attr))
+        self.verify_var.set(bool(settings.verify))
 
     # ---------------------------------------------------------------- 分组
     def _roster_groups(self) -> list:
@@ -836,7 +1227,7 @@ class App(ttk.Frame):
     def edit_group(self) -> None:
         selection = self.group_tree.selection() if hasattr(self, "group_tree") else ()
         if not selection:
-            messagebox.showinfo(TITLE, "先在上面选中一个分组。")
+            self._notice("先在上面选中一个分组。")
             return
         index = int(selection[0])
         group = self._group_dialog(self.roster_groups[index])
@@ -847,7 +1238,7 @@ class App(ttk.Frame):
     def delete_group(self) -> None:
         selection = self.group_tree.selection() if hasattr(self, "group_tree") else ()
         if not selection:
-            messagebox.showinfo(TITLE, "先在上面选中一个分组。")
+            self._notice("先在上面选中一个分组。")
             return
         index = int(selection[0])
         group = self.roster_groups.pop(index)
@@ -862,7 +1253,7 @@ class App(ttk.Frame):
             try:
                 self._load_roster_book()
             except ValueError as exc:
-                messagebox.showerror(TITLE, str(exc))
+                self._report_error(str(exc))
                 return None
         book = self.roster_book
         names = {character.unit_id: character.label for character in book.characters()}
@@ -885,7 +1276,7 @@ class App(ttk.Frame):
         self._hint(minimum_entry, "每支队伍里这个分组至少上几个人；填 0 等于不限制（成员回到未分组）。")
         ttk.Label(window, text="成员").grid(row=2, column=0, sticky="nw", padx=8, pady=2)
         members_var = tk.StringVar(value="")
-        member_label = ttk.Label(window, textvariable=members_var, wraplength=320, foreground="#333")
+        member_label = ttk.Label(window, textvariable=members_var, wraplength=320)
         member_label.grid(row=3, column=0, columnspan=2, sticky="w", padx=8, pady=(0, 4))
 
         def refresh_members() -> None:
@@ -916,7 +1307,7 @@ class App(ttk.Frame):
                     minimum=int(minimum_var.get() or 0),
                 )
             except (TypeError, ValueError) as exc:
-                messagebox.showerror(TITLE, str(exc))
+                self._report_error(str(exc))
                 return
             window.destroy()
 
@@ -942,15 +1333,60 @@ class App(ttk.Frame):
             return {}
         return raw if isinstance(raw, dict) else {}
 
+    def _preset_dialog(self, title: str, choices: list[str] | None = None) -> str | None:
+        window = tk.Toplevel(self)
+        window.withdraw()
+        window.title(title)
+        window.transient(self.master)
+        window.resizable(False, False)
+        body = ttk.Frame(window, padding=(18, 14))
+        body.pack(fill="both", expand=True)
+        name = tk.StringVar(master=window)
+        ttk.Label(body, text="预设名称" if choices is None else "选择预设").pack(anchor="w", pady=(0, 6))
+        if choices is None:
+            field = ttk.Entry(body, textvariable=name, width=32)
+        else:
+            field = ttk.Combobox(body, textvariable=name, values=choices, state="readonly", width=32)
+            field.current(0)
+        field.pack(fill="x")
+        result = None
+
+        def confirm(_event=None):
+            nonlocal result
+            if name.get().strip():
+                result = name.get().strip()
+                window.destroy()
+            return "break"
+
+        actions = ttk.Frame(body)
+        actions.pack(fill="x", pady=(16, 0))
+        accept = ttk.Button(actions, text="保存" if choices is None else "载入",
+                            style="Primary.TButton", command=confirm)
+        accept.pack(side="right")
+        ttk.Button(actions, text="取消", command=window.destroy).pack(side="right", padx=(0, 8))
+        if choices is None:
+            def update_button(*_):
+                accept.state(["!disabled"] if name.get().strip() else ["disabled"])
+            name.trace_add("write", update_button)
+            update_button()
+        field.bind("<Return>", confirm)
+        window.bind("<Escape>", lambda _: window.destroy())
+        self._center_window(window, parent=self.master)
+        window.deiconify()
+        window.wait_visibility()
+        window.grab_set()
+        field.focus_set()
+        self.wait_window(window)
+        return result
+
     def save_preset(self) -> None:
-        from tkinter import simpledialog
         import json
 
-        name = simpledialog.askstring("保存预设", "给这套角色 / 分组起个名字：", parent=self)
-        if not name or not name.strip():
+        name = self._preset_dialog("保存预设")
+        if name is None:
             return
         presets = self._read_presets()
-        presets[name.strip()] = {
+        presets[name] = {
             "pool": [int(unit) for unit in self._pool_ids()],
             "groups": [group.to_dict() for group in self.roster_groups],
         }
@@ -959,33 +1395,28 @@ class App(ttk.Frame):
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(json.dumps(presets, ensure_ascii=False, indent=1), encoding="utf-8")
         except OSError as exc:
-            messagebox.showerror(TITLE, f"预设写不进去：{exc}")
+            self._report_error(f"预设写不进去：{exc}")
             return
-        self._append_log(f"已保存预设：{name.strip()}（{path}）")
+        self._append_log(f"已保存预设：{name}（{path}）")
 
     def load_preset(self) -> None:
-        from tkinter import simpledialog
         from .roster import GroupSpec
 
         presets = self._read_presets()
         if not presets:
-            messagebox.showinfo(TITLE, "还没有保存过预设。")
+            self._notice("还没有保存过预设。")
             return
-        name = simpledialog.askstring(
-            "载入预设",
-            "要载入哪一套？" + chr(10) + chr(10) + chr(10).join(sorted(presets)),
-            parent=self,
-        )
-        if not name or name.strip() not in presets:
+        name = self._preset_dialog("载入预设", sorted(presets))
+        if name is None:
             return
-        data = presets[name.strip()]
+        data = presets[name]
         pool = [int(unit) for unit in data.get("pool") or []]
         self.roster_pool_var.set(",".join(str(unit) for unit in pool))
         self.roster_groups = [
             GroupSpec.from_dict(item) for item in data.get("groups") or [] if isinstance(item, dict)
         ]
         self._refresh_groups()
-        self._append_log(f"已载入预设：{name.strip()}（{len(pool)} 个候选，{len(self.roster_groups)} 个分组）")
+        self._append_log(f"已载入预设：{name}（{len(pool)} 个候选，{len(self.roster_groups)} 个分组）")
 
     def choose_characters(self) -> None:
         """候选角色：用通用挑选窗口选完写回候选池。"""
@@ -1003,11 +1434,11 @@ class App(ttk.Frame):
             try:
                 self._load_roster_book()
             except ValueError as exc:
-                messagebox.showerror(TITLE, str(exc))
+                self._report_error(str(exc))
                 return
         book = self.roster_book
         chosen = {int(unit) for unit in initial}
-        picked: list[int] = []
+        picked: list[int] | None = None
         window = tk.Toplevel(self)
         window.title(title)
         window.transient(self.master)
@@ -1017,7 +1448,7 @@ class App(ttk.Frame):
         search_var = tk.StringVar(value="")
         entry = ttk.Entry(window, textvariable=search_var)
         entry.grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 4))
-        self._hint(entry, "按名字或 ID 过滤（留空就是全部）。")
+        Tooltip(entry, "按名字或 ID 过滤（留空就是全部）。")
 
         filters = ttk.Frame(window)
         filters.grid(row=1, column=0, sticky="ew", padx=8)
@@ -1030,123 +1461,78 @@ class App(ttk.Frame):
             values=["全部职能", *ROLE_LABELS.values()],
         )
         role_box.pack(side="left")
-        self._hint(role_box, "按职能过滤：攻击型 / 破防型 / 增益型 / 减益型 / 强化型 / 治疗型 / 坦克型 / 干扰型。")
+        Tooltip(role_box, "按职能过滤：攻击型 / 破防型 / 增益型 / 减益型 / 强化型 / 治疗型 / 坦克型 / 干扰型。")
         talent_box = ttk.Combobox(
             filters, textvariable=talent_var, state="readonly", width=8,
             values=["全部属性", *TALENT_LABELS.values()],
         )
         talent_box.pack(side="left", padx=(8, 0))
-        self._hint(talent_box, "按属性过滤：火 / 水 / 风 / 光 / 暗。")
+        Tooltip(talent_box, "按属性过滤：火 / 水 / 风 / 光 / 暗。")
         ttk.Label(
             filters,
             text="按站位排列（攻击范围小的在前）；职能、属性、宽度来自 unit_info.php。",
-            foreground="#666",
+            style="Muted.TLabel",
         ).pack(side="left", padx=(10, 0))
 
         holder = ttk.Frame(window)
         holder.grid(row=3, column=0, sticky="nsew", padx=8, pady=4)
         holder.columnconfigure(0, weight=1)
         holder.rowconfigure(0, weight=1)
-        canvas = tk.Canvas(holder, highlightthickness=0, height=380)
+        from .roster import lineup_order
+
+        by_id = {c.unit_id: c for c in book.characters()}
+        ordered = [by_id[unit] for unit in lineup_order(tuple(by_id))]
+
+        def request_icons(units):
+            if self.icon_busy():
+                return False
+            self.start_icon_download(units)
+            return True
+
+        canvas = CharacterGrid(holder, chosen, self._icons, request_icons,
+                               background=self.colors.panel, foreground=self.colors.text, accent=self.colors.violet,
+                               empty=self.colors.check_empty)
         bar = ttk.Scrollbar(holder, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=bar.set)
+        def scrolled(first, last):
+            bar.set(first, last)
+            canvas.paint()
+        canvas.configure(yscrollcommand=scrolled)
         canvas.grid(row=0, column=0, sticky="nsew")
         bar.grid(row=0, column=1, sticky="ns")
-        inner = ttk.Frame(canvas)
-        canvas.create_window((0, 0), window=inner, anchor="nw")
-        inner.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
 
-        def on_wheel(event) -> str:
-            step = -1 if getattr(event, "delta", 0) > 0 else 1
-            if getattr(event, "num", None) == 4:
-                step = -1
-            elif getattr(event, "num", None) == 5:
-                step = 1
-            canvas.yview_scroll(step * 3, "units")
+        def on_wheel(event):
+            if event.num in (4, 5):
+                steps = -1 if event.num == 4 else 1
+            else:
+                steps = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
+            canvas.yview_scroll(steps * 3, "units")
             return "break"
 
-        for target in (window, canvas, inner, holder):
-            target.bind("<MouseWheel>", on_wheel)
+        for event in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            window.bind(event, on_wheel)
 
-        icons: dict = {}
-
-        def icon_for(unit: int):
-            if unit in icons:
-                return icons[unit]
-            path = cached_icon(unit)
-            image = None
-            if path is not None:
-                try:
-                    from PIL import Image, ImageTk
-
-                    with Image.open(path) as loaded:
-                        image = ImageTk.PhotoImage(loaded.resize((28, 28)))
-                except Exception:  # Pillow 没装 / 图片坏掉都不该让窗口崩
-                    image = None
-            icons[unit] = image
-            return image
-
-        def toggle(unit: int, var: tk.BooleanVar) -> None:
-            if var.get():
-                chosen.add(unit)
-            else:
-                chosen.discard(unit)
-
-        def render(*_args) -> None:
-            for widget in inner.winfo_children():
-                widget.destroy()
+        def render(*_args):
             query = search_var.get().strip().lower()
-            role_name = role_var.get()
-            talent_name = talent_var.get()
-            matches = []
-            for character in book.characters():
-                if role_name != "全部职能" and character.role_label != role_name:
-                    continue
-                if talent_name != "全部属性" and character.talent_label != talent_name:
-                    continue
-                if query and query not in character.label.lower() and query not in str(character.unit_id):
-                    continue
-                matches.append(character)
-            # 按游戏站位排（攻击范围小的在前，宽度相同按 unitId）
-            from .roster import lineup_order
-
-            position = {
-                unit: index
-                for index, unit in enumerate(lineup_order([item.unit_id for item in matches]))
-            }
-            matches.sort(key=lambda item: position[item.unit_id])
-            for index, character in enumerate(matches[:400]):
-                var = tk.BooleanVar(value=character.unit_id in chosen)
-                image = icon_for(character.unit_id)
-                label = f"{character.label}（{character.group_label or '未知'}）"
-                button = ttk.Checkbutton(
-                    inner,
-                    text=label,
-                    variable=var,
-                    image=image,
-                    compound="left",
-                    command=lambda unit=character.unit_id, item=var: toggle(unit, item),
-                )
-                button.grid(row=index // 3, column=index % 3, sticky="w", padx=4, pady=1)
-                button.bind("<MouseWheel>", on_wheel)
-                button.image = image  # 防止图片被回收
-            canvas.configure(scrollregion=canvas.bbox("all"))
-            missing = [item.unit_id for item in matches[:400] if cached_icon(item.unit_id) is None]
-            if missing and not self.icon_busy():
-                self._icon_refresh = render
-                self.start_icon_download(missing)
+            role, talent = role_var.get(), talent_var.get()
+            canvas.set_rows([c for c in ordered
+                             if (role == "全部职能" or c.role_label == role)
+                             and (talent == "全部属性" or c.talent_label == talent)
+                             and (not query or query in c.label.lower() or query in c.name.lower()
+                                  or query in str(c.unit_id))])
 
         search_var.trace_add("write", render)
         role_box.bind("<<ComboboxSelected>>", render)
         talent_box.bind("<<ComboboxSelected>>", render)
+        self._icon_refresh.add(canvas.icons_changed)
 
         actions = ttk.Frame(window)
         actions.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
 
         def confirm() -> None:
+            nonlocal picked
             ordered = [int(unit) for unit in initial if int(unit) in chosen]
             ordered += sorted(chosen - set(ordered))
-            picked.extend(ordered)
+            picked = ordered
             window.destroy()
 
         ttk.Button(actions, text="清空", command=lambda: (chosen.clear(), render())).pack(side="left")
@@ -1155,12 +1541,13 @@ class App(ttk.Frame):
         self._center_window(window, parent=self.master)
         entry.focus_set()
         self.wait_window(window)
-        return picked if picked else None
+        self._icon_refresh.discard(canvas.icons_changed)
+        return picked
 
     def show_roster_results(self) -> None:
         """列出伤害最高的 100 支队伍，可以挑一支再打一遍 32 种组合。"""
         if not self.roster_results:
-            messagebox.showinfo(TITLE, "还没有结果：先跑一次阵容搜索。")
+            self._notice("还没有结果：先跑一次阵容搜索。")
             return
         window = tk.Toplevel(self.master)
         window.title("阵容结果（前 100 支）")
@@ -1204,14 +1591,14 @@ class App(ttk.Frame):
         def probe() -> None:
             selection = tree.selection()
             if not selection:
-                messagebox.showinfo(TITLE, "先在列表里选一支队伍。")
+                self._notice("先在列表里选一支队伍。")
                 return
             index = tree.index(selection[0])
             item = self.roster_results[index]
             team = tuple(int(unit) for unit in (item.get("team") or []))
             self._probe_team = team
             if self.session is not None:
-                messagebox.showinfo(TITLE, "等这次跑完再看。")
+                self._notice("等这次跑完再看。")
                 return
             # Tk 变量只能在主线程读：worker 里碰界面变量会抛
             # RuntimeError: main thread is not in main loop（以前「点了一行日志就没反应」就是这个）
@@ -1225,7 +1612,7 @@ class App(ttk.Frame):
                 names = self._roster_names()
                 shown = lineup_names(team, names)
             except Exception as exc:  # noqa: BLE001 - report to the UI
-                messagebox.showerror(TITLE, f"试这队失败：\n{exc}")
+                self._report_error(f"试这队失败：\n{exc}")
                 return
             self.status_var.set(f"正在试这队：{shown}（{2 ** len(team)} 种组合）")
             self._append_log(f"试这队 {2 ** len(team)} 种组合：{shown}")
@@ -1333,7 +1720,7 @@ class App(ttk.Frame):
     def download_pool_icons(self) -> None:
         units = self._pool_ids()
         if not units:
-            messagebox.showinfo(TITLE, "先选候选角色。")
+            self._notice("先选候选角色。")
             return
         self.start_icon_download(units)
 
@@ -1385,14 +1772,10 @@ class App(ttk.Frame):
         return list(dict.fromkeys(units))
 
     def _roster_settings(self):
-        from .roster import RosterSettings, TEAM_SIZE, GroupSpec
+        from .roster import RosterSettings, GroupSpec
 
         pool = tuple(self._pool_ids()) or tuple(self.save.unit_ids if self.save is not None else ())
         groups = [GroupSpec.from_dict(group.to_dict()) for group in self.roster_groups]
-        # 分组里的成员必须在候选池里，缺的自动补进去
-        extra = [unit for group in groups for unit in group.members if unit not in pool]
-        if extra:
-            pool = pool + tuple(unit for unit in dict.fromkeys(extra) if unit not in pool)
         return RosterSettings(
             endpoint=endpoint_for(self._port()),
             battle_time=self._number(self.battle_time_var, "战斗秒数", 1, 90),
@@ -1438,7 +1821,6 @@ class App(ttk.Frame):
         self.roster_book = book
         if self.roster_groups:
             self._refresh_groups()
-        self._icons.clear() if hasattr(self, "_icons") else None
         self._append_log(
             f"角色表：{len(book.characters())} 个角色（职能 / 属性 / 宽度 {len(book.info)} 条）"
         )
@@ -1457,14 +1839,15 @@ class App(ttk.Frame):
         self.batch_size_var.set(str(settings.batch_size))
 
     def _build_items(self) -> None:
-        frame = ttk.LabelFrame(self, text="可调项（点一行切换选中）", padding=6)
-        frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        frame = ttk.LabelFrame(self.output, text="可调项", padding=8)
+        self.output.add(frame, text="时间轴")
         self.items_frame = frame
         frame.columnconfigure(0, weight=1)
         frame.rowconfigure(1, weight=1)
 
         bar = ttk.Frame(frame)
         bar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 4))
+        self.item_controls = bar
         ttk.Button(bar, text="全选", command=lambda: self.set_all(True)).pack(side="left")
         ttk.Button(bar, text="全不选", command=lambda: self.set_all(False)).pack(side="left", padx=(6, 0))
         ttk.Button(bar, text="反选", command=self.invert).pack(side="left", padx=(6, 0))
@@ -1478,7 +1861,8 @@ class App(ttk.Frame):
             frame, columns=("check", "label", "frame"), show="headings", height=7, selectmode="browse",
         )
         self.items_tree.heading("check", text="选")
-        self.items_tree.heading("label", text="项")
+        self.items_tree.heading("label", text="角色 / UB", anchor="w")
+        self.items_tree.tag_configure("alternate", background=self.colors.alternate)
         self.items_tree.heading("frame", text="当前帧")
         self.items_tree.column("check", width=44, anchor="center", stretch=False)
         self.items_tree.column("label", width=240)
@@ -1492,9 +1876,9 @@ class App(ttk.Frame):
         self.items_tree.bind("<space>", self._toggle_focused)
 
     def _build_actions(self) -> None:
-        bar = ttk.Frame(self)
-        bar.grid(row=3, column=0, sticky="ew", pady=(8, 0))
-        self.start_button = ttk.Button(bar, text="开始调帧", command=self.start)
+        bar = ttk.Frame(self, padding=(12, 8))
+        bar.grid(row=2, column=0, sticky="ew")
+        self.start_button = ttk.Button(bar, text="开始调帧", style="Primary.TButton", command=self.start)
         self.start_button.pack(side="left")
         self._hint(
             self.start_button,
@@ -1513,22 +1897,88 @@ class App(ttk.Frame):
         self.open_report_button = ttk.Button(bar, text="打开报告", command=self.open_report)
         self.open_report_button.pack(side="left", padx=(6, 0))
         self._hint(self.open_report_button, "打开本次运行的 报告.md。")
+        self.clock = tk.Canvas(bar, width=46, height=34, background=self.colors.panel, cursor="hand2",
+                               takefocus=True, highlightthickness=1, highlightbackground=self.colors.panel,
+                               highlightcolor=self.colors.violet)
+        self.clock.pack(side="right")
+        for event in ("<Button-1>", "<space>", "<Return>"):
+            self.clock.bind(event, self._toggle_theme)
+        self._hint(self.clock, "点击时钟切换白天和黑夜主题。")
+        self._tick_clock()
 
-        self.progress = ttk.Progressbar(bar, length=200, mode="determinate")
-        self.progress.pack(side="right")
+        progress_row = ttk.Frame(self, padding=(12, 2, 12, 8))
+        progress_row.grid(row=3, column=0, sticky="ew")
+        self.progress = ttk.Progressbar(progress_row, mode="determinate")
+        self.progress.pack(side="right", fill="x", expand=True)
         self._hint(self.progress, "已完成的可调项数 / 总项数。")
-        self.counter_label = ttk.Label(bar, text="写回 0 / 跳过 0 / 失败 0 / 场次 0")
-        self.counter_label.pack(side="right", padx=(0, 10))
+        self.counter_label = ttk.Label(progress_row, text="写回 0 / 跳过 0 / 失败 0 / 场次 0")
+        self.counter_label.pack(side="left", padx=(0, 12))
         self._hint(self.counter_label, "写回=已采纳的最优帧数，场次=实际打了多少场模拟。")
 
+    def _draw_clock(self, now):
+        dial, colors = self.clock, self.colors
+        dial.delete("all")
+        dial.configure(background=colors.panel, highlightbackground=colors.panel, highlightcolor=colors.violet)
+        dial.create_oval(3, 4, 29, 30, fill=colors.field, outline=colors.violet, width=2)
+        for angle, length in ((now.hour * 30 + now.minute / 2, 7), (now.minute * 6, 10)):
+            radians = math.radians(angle)
+            dial.create_line(16, 17, 16 + length * math.sin(radians), 17 - length * math.cos(radians),
+                             fill=colors.text, width=2)
+        if colors is LIGHT:
+            dial.create_oval(32, 6, 40, 14, fill="#a15b07", outline="")
+            for degree in range(0, 360, 45):
+                x, y = math.cos(math.radians(degree)), math.sin(math.radians(degree))
+                dial.create_line(36+6*x, 10+6*y, 36+8*x, 10+8*y, fill="#a15b07")
+        else:
+            dial.create_oval(32, 4, 44, 16, fill=colors.violet, outline="")
+            dial.create_oval(36, 2, 46, 12, fill=colors.panel, outline="")
+
+    def _tick_clock(self):
+        now = datetime.datetime.now()
+        self._draw_clock(now)
+        self.after(60000 - now.second * 1000 - now.microsecond // 1000, self._tick_clock)
+
+    def _toggle_theme(self, _event=None):
+        self.colors = colors = LIGHT if self.colors is DARK else DARK
+        _workspace_theme(self.master, colors)
+        self._draw_clock(datetime.datetime.now())
+        self._draw_axis_overview()
+        self.items_tree.tag_configure("alternate", background=colors.alternate)
+        self.log_text.configure(background=colors.field, foreground=colors.text, insertbackground=colors.cyan,
+                                selectbackground=colors.selection, selectforeground=colors.text)
+        for view in self.scroll_views.values():
+            view.configure(background=colors.panel)
+        widgets = list(self.master.winfo_children())
+        while widgets:
+            widget = widgets.pop()
+            widgets.extend(widget.winfo_children())
+            if isinstance(widget, CharacterGrid):
+                widget.set_colors(colors.panel, colors.text, colors.violet, colors.check_empty)
+            elif isinstance(widget, tk.Toplevel):
+                widget.configure(background=colors.panel)
+            elif isinstance(widget, ttk.Combobox):
+                # Tk 的下拉列表首次展开后就保留，已有列表须与新列表一起换色。
+                listing = f"{widget}.popdown.f.l"
+                if int(widget.tk.call("winfo", "exists", listing)):
+                    widget.tk.call(listing, "configure", "-background", colors.panel, "-foreground", colors.text,
+                                   "-selectbackground", colors.selection, "-selectforeground", colors.violet)
+        self.save_settings()
+        return "break"
+
     def _build_output(self) -> None:
-        notebook = ttk.Notebook(self)
-        notebook.grid(row=4, column=0, sticky="nsew", pady=(8, 0))
+        notebook = self.output
 
         log_tab = ttk.Frame(notebook, padding=2)
         log_tab.rowconfigure(0, weight=1)
         log_tab.columnconfigure(0, weight=1)
-        self.log_text = ScrolledText(log_tab, height=12, wrap="word", state="disabled")
+        self.log_tab = log_tab
+        self.log_text = tk.Text(log_tab, width=30, height=10, wrap="word", state="disabled",
+                                foreground=self.colors.text, background=self.colors.field, insertbackground=self.colors.cyan,
+                                selectforeground=self.colors.text, selectbackground=self.colors.selection, relief="flat", padx=10, pady=8,
+                                spacing1=2, spacing3=2, font="TkDefaultFont", highlightthickness=0)
+        log_scroll = ttk.Scrollbar(log_tab, command=self.log_text.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
         self.log_text.grid(row=0, column=0, sticky="nsew")
         notebook.add(log_tab, text="日志")
 
@@ -1546,16 +1996,62 @@ class App(ttk.Frame):
             ("battles", "场次", 70, "e"),
         ):
             self.result_tree.heading(column, text=heading)
-            self.result_tree.column(column, width=width, anchor=anchor)
+            self.result_tree.column(column, width=width, minwidth=36, stretch=False, anchor=anchor)
+        self._enable_column_resize(self.result_tree)
         self.result_tree.grid(row=0, column=0, sticky="nsew")
         scroll = ttk.Scrollbar(result_tab, orient="vertical", command=self.result_tree.yview)
         scroll.grid(row=0, column=1, sticky="ns")
         self.result_tree.configure(yscrollcommand=scroll.set)
+        xscroll = ttk.Scrollbar(result_tab, orient="horizontal", command=self.result_tree.xview)
+        xscroll.grid(row=1, column=0, sticky="ew")
+        self.result_tree.configure(xscrollcommand=xscroll.set)
         notebook.add(result_tab, text="结果")
 
-        status = ttk.Label(self, textvariable=self.status_var, anchor="w", foreground="#234")
-        status.grid(row=5, column=0, sticky="ew", pady=(6, 0))
+        status = ttk.Label(self, textvariable=self.status_var, anchor="w", style="Status.TLabel")
+        status.grid(row=4, column=0, sticky="ew", pady=(6, 0))
         self._hint(status, "当前状态：就绪 / 运行中 / 完成 / 出错。")
+
+    @staticmethod
+    def _enable_column_resize(tree):
+        # Tk 默认的 separator 拖动会从后面的列借宽度，整表因此无法重新拉宽。
+        drag = None
+        def begin(event):
+            nonlocal drag
+            if tree.identify_region(event.x, event.y) == "separator":
+                column = tree.identify_column(event.x)
+                drag = (column, event.x_root, tree.column(column, "width"))
+                return "break"
+
+        def resize(event):
+            if drag:
+                column, origin, width = drag
+                tree.column(column, width=max(tree.column(column, "minwidth"), width + event.x_root - origin))
+                return "break"
+
+        def finish(event):
+            nonlocal drag
+            if drag:
+                resize(event)
+                drag = None
+                return "break"
+
+        tree.bind("<ButtonPress-1>", begin)
+        tree.bind("<B1-Motion>", resize)
+        tree.bind("<ButtonRelease-1>", finish)
+
+    def _result_columns(self, mode):
+        names = {
+            "frame": ("可调项", "轮次", "原帧 → 新帧", "决策", "期望伤害（基线 → 本项）", "场次"),
+            "ga": ("迭代", "代数", "", "刷新记录", "最高期望伤害", "场次"),
+            "anneal": ("迭代", "步数", "", "温度", "最高期望伤害", "场次"),
+            "cycle": ("模式", "层数", "", "记录", "最高期望伤害", "场次"),
+            "roster": ("队伍", "进度", "角色", "AUTO / SET", "最高期望伤害", "场次"),
+            "zero": ("进度", "阵容", "逐刀操作", "", "最高期望伤害", "场次"),
+        }[mode]
+        columns = self.result_tree["columns"]
+        for col, title in zip(columns, names):
+            self.result_tree.heading(col, text=title)
+        self.result_tree.configure(displaycolumns=[col for col, title in zip(columns, names) if title])
 
     # ------------------------------------------------------------------ items
 
@@ -1573,9 +2069,10 @@ class App(ttk.Frame):
     def refresh_items(self) -> None:
         selected = self.items_tree.selection()
         self.items_tree.delete(*self.items_tree.get_children())
-        for target in self.targets:
+        for index, target in enumerate(self.targets):
             mark = CHECK_ON if target.key in self.selection else CHECK_OFF
-            self.items_tree.insert("", "end", iid=target.key, values=(mark, target.label, text(target.raw)))
+            self.items_tree.insert("", "end", iid=target.key, values=(mark, target.label, text(target.raw)),
+                                   tags=("alternate",) if index % 2 else ())
         if selected:
             keep = [iid for iid in selected if iid in self.selection]
             if keep:
@@ -1584,11 +2081,12 @@ class App(ttk.Frame):
 
     def _click_item(self, event: tk.Event) -> None:
         iid = self.items_tree.identify_row(event.y)
-        if not iid:
-            return
-        self._toggle(iid)
+        if iid and self._mode() == "frame":
+            self._toggle(iid)
 
     def _toggle_focused(self, _event: tk.Event) -> str:
+        if self._mode() != "frame":
+            return "break"
         for iid in self.items_tree.selection():
             self._toggle(iid)
         return "break"
@@ -1635,11 +2133,8 @@ class App(ttk.Frame):
         self.calculator_var.set(folder)
         exe = find_server(folder)
         if exe is None:
-            messagebox.showwarning(
-                TITLE,
-                "这个目录里没找到 PCRCalculatorServer.exe。\n"
-                "请选 PCRCalculator 的安装目录，或它里面的 server 子目录。",
-            )
+            self._report_error("这个目录里没找到 PCRCalculatorServer.exe。\n"
+                "请选 PCRCalculator 的安装目录，或它里面的 server 子目录。")
             return
         self.status_var.set(f"摸轴器：{exe}")
 
@@ -1647,9 +2142,9 @@ class App(ttk.Frame):
         try:
             # 语义 GA 也能吃「只有语义数据」的轴，所以这里不强求帧轴；
             # 切到逐帧搜索时再检查有没有帧。
-            save = read_save(path, require_frames=False, log=self._append_log)
+            save = read_save(path, require_frames=False, allow_empty=True, log=self._append_log)
         except (ValueError, OSError) as exc:
-            messagebox.showerror(TITLE, f"打不开这条轴：\n{exc}")
+            self._report_error(f"打不开这条轴：\n{exc}")
             self.status_var.set("轴文件读取失败")
             return
         self.save = save
@@ -1657,11 +2152,14 @@ class App(ttk.Frame):
         if not keep_root or self.output_root is None:
             self.output_root = save.path.parent
         self.axis_var.set(str(save.path))
+        self.axis_title.set(save.path.name)
+        self._draw_axis_overview()
+        self.axis_tip.message = str(save.path)
         duration = save.suggested_duration(save.header)
         self.battle_time_var.set(str(duration))
         self.seed_var.set(str(save.battle_seed if save.battle_seed is not None else 666))
         self.axis_info.set(
-            f"{save.header}｜角色 {'、'.join(save.unit_names)}｜Boss {save.boss_label}"
+            f"{'、'.join(save.unit_names)}　｜　{save.boss_label}"
             f"｜建议 {duration} 秒｜种子 {save.battle_seed if save.battle_seed is not None else '未指定'}"
         )
         self.rebuild_targets()
@@ -1840,24 +2338,27 @@ class App(ttk.Frame):
 
     def _sync_mode(self) -> None:
         key = self._mode()
-        if key == mode_registry.GA:
-            self.settings_tabs.select(self.tab_ga)
-            self.items_frame.configure(text="可调项（语义 GA 会整条轴一起优化，这里仅参考）")
-            start_text = "开始优化"
-        elif key == mode_registry.ANNEAL:
-            self.settings_tabs.select(self.tab_anneal)
-            self.items_frame.configure(text="可调项（退火会整条轴一起优化，这里仅参考）")
-            start_text = "开始退火"
-        elif key == mode_registry.ROSTER:
-            self.settings_tabs.select(self.tab_roster)
-            self.items_frame.configure(text="可调项（阵容搜索只换人，这里仅参考）")
-            start_text = "开始搜索"
-        else:
-            self.settings_tabs.select(self.tab_frame)
-            self.items_frame.configure(text="可调项（点一行切换选中）")
-            start_text = "开始调帧"
-        if self.start_button["state"] != "disabled":
-            self.start_button.configure(text=start_text)
+        previous = getattr(self, "_shown_mode", None)
+        if previous == key:
+            return
+        if previous is not None:
+            self.mode_pages[previous].grid_remove()
+        self.mode_pages[key].grid(row=0, column=0, sticky="ew")
+        self._shown_mode = key
+        if self.session is None and not self.result_tree.get_children():
+            self._result_columns(key)
+        self.scroll_views[self.tab_mode].yview_moveto(0)
+        self.settings_tabs.select(self.tab_mode)
+        if key == "frame":
+            self.item_controls.grid()
+            self.items_tree.configure(displaycolumns=("check", "label", "frame"))
+        elif previous in (None, "frame"):
+            self.item_controls.grid_remove()
+            self.items_tree.configure(displaycolumns=("label", "frame"))
+        self.items_frame.configure(text="可调项（点击选择）" if key == "frame" else "原轴出手顺序")
+        actions = {"frame": "开始调帧", "ga": "开始优化", "anneal": "开始退火", "roster": "开始阵容搜索",
+                   "zero": "开始 0 押", "cycle": "开始循环搜索"}
+        self.start_button.configure(text=actions[key])
 
     # ------------------------------------------------------- settings storage
 
@@ -1868,6 +2369,7 @@ class App(ttk.Frame):
             "autostart": bool(self.autostart_var.get()),
             "excel": self.axis_var.get().strip(),
             "mode": self._mode(),
+            "cycle": {k: v.get() for k, v in self.cycle_vars.items()},
             "job": {
                 "battle_time": self.battle_time_var.get().strip(),
                 "seed": self.seed_var.get().strip(),
@@ -1935,7 +2437,13 @@ class App(ttk.Frame):
             "every_combo": bool(self.every_combo_var.get()),
             "verify": bool(self.verify_var.get()),
         },
+            "zero": {
+                "iterations": self.zero_iterations_var.get().strip(),
+                "batch": self.zero_batch_var.get().strip(),
+                "ub_limit": self.zero_ub_limit_var.get().strip(),
+            },
             "selection": sorted(self.selection),
+            "theme": "light" if self.colors is LIGHT else "dark",
             "geometry": self.master.geometry() if self.master.winfo_exists() else "",
         }
 
@@ -1966,8 +2474,7 @@ class App(ttk.Frame):
         except (tk.TclError, ValueError):
             pass
 
-    def _restore_settings(self) -> None:
-        data = read_settings()
+    def _restore_settings(self, data) -> None:
         if not data:
             return
         self.calculator_var.set(str(data.get("calculator") or ""))
@@ -1977,6 +2484,8 @@ class App(ttk.Frame):
         mode = str(data.get("mode") or mode_registry.FRAME)
         self.mode_var.set(dict(MODES).get(mode, MODES[0][1]))
         self._sync_mode()
+        for k, v in self.cycle_vars.items():
+            v.set((data.get("cycle") or {}).get(k, v.get()))
         ga = data.get("ga") or {}
         for var, key in (
             (self.population_var, "population"),
@@ -2057,6 +2566,16 @@ class App(ttk.Frame):
             self.every_combo_var.set(bool(roster.get("every_combo", True)))
             self.verify_var.set(bool(roster.get("verify", True)))
             self._refresh_groups()  # 上次保存的分组要立刻显示出来（不然得先「新建」一次才看得见）
+        zero = data.get("zero")
+        if isinstance(zero, dict):
+            for key, var in (
+                ("iterations", self.zero_iterations_var),
+                ("batch", self.zero_batch_var),
+                ("ub_limit", self.zero_ub_limit_var),
+            ):
+                value = zero.get(key)
+                if value not in (None, ""):
+                    var.set(str(value))
 
     # -------------------------------------------------------------------- run
 
@@ -2076,7 +2595,7 @@ class App(ttk.Frame):
 
     def start(self, resume_state: dict | None = None, run_dir: Path | None = None) -> None:
         if self.save is None:
-            messagebox.showinfo(TITLE, "先选一条 PCRCalculator 导出的轴。")
+            self._notice("先选一条 PCRCalculator 导出的轴。")
             return
         if self.worker is not None and self.worker.is_alive():
             return
@@ -2099,10 +2618,10 @@ class App(ttk.Frame):
                     include_boss=job_settings.include_boss, items=job_settings.items,
                 )
                 if self.only_checked_var.get() and not self.selection:
-                    messagebox.showinfo(TITLE, "没有选中任何项。")
+                    self._notice("没有选中任何项。")
                     return
                 if not targets:
-                    messagebox.showinfo(TITLE, "按当前设置没有可调的项。")
+                    self._notice("按当前设置没有可调的项。")
                     return
             elif mode == mode_registry.GA:
                 settings = self._ga_settings()
@@ -2112,6 +2631,13 @@ class App(ttk.Frame):
                 if not self._pool_ids():
                     raise ValueError("先在「候选角色」里挑人（或点「选择角色…」）。")
                 settings = self._roster_settings()
+            elif mode == mode_registry.CYCLE:
+                values = {k: v.get() for k, v in self.cycle_vars.items()}
+                for k in ("battle_time", "seed", "samples", "batch_size", "timeout"):
+                    values[k] = getattr(self, k + "_var").get()
+                settings = dataclasses.replace(spec.from_values(values, self.save), endpoint=endpoint_for(self._port()))
+            elif mode == mode_registry.ZERO:
+                settings = self._zero_settings()
             else:
                 # 以后新接的模式：界面不熟它，就用它声明的默认值。
                 settings = spec.from_values(spec.defaults(), self.save)
@@ -2119,7 +2645,7 @@ class App(ttk.Frame):
             if mode == mode_registry.ROSTER:
                 self._load_roster_book()
         except ValueError as exc:
-            messagebox.showerror(TITLE, str(exc))
+            self._report_error(str(exc))
             return
         run_dir = Path(run_dir) if run_dir else timestamp_dir(self._out_root(), self.save.path.stem)
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -2142,12 +2668,15 @@ class App(ttk.Frame):
             )
         except (ValueError, OSError) as exc:
             self._close_log_file()
-            messagebox.showerror(TITLE, f"无法开始：{exc}")
+            self._report_error(f"无法开始：{exc}")
             return
         self.save_settings()
         self.shown_results = 0
         self.shown_history = 0
+        self.output.select(self.log_tab)
+        self._result_columns(mode)
         self.shown_team = ()
+        self.shown_zero = ()
         self.result_tree.delete(*self.result_tree.get_children())
         total = len(targets) * max(1, int(getattr(settings, "job", settings).passes)) if targets else 1
         if mode == mode_registry.GA:
@@ -2158,6 +2687,10 @@ class App(ttk.Frame):
             from .roster import team_count
 
             total = max(1, team_count(settings))
+        elif mode == mode_registry.CYCLE:
+            total = settings.depth
+        elif mode == mode_registry.ZERO:
+            total = max(1, int(settings.iterations) + 1)
         self.progress.configure(maximum=max(total, 1), value=0)
         self._set_running(True)
         self.status_var.set(f"运行中…（{spec.label}）")
@@ -2222,6 +2755,7 @@ class App(ttk.Frame):
                 self.roster_results = [dict(item) for item in summary["teams"]]
             semantic = getattr(job, "history", None) is not None
             roster = getattr(job, "teams_total", None) is not None
+            zero = getattr(job, "rounds_total", None) is not None
             if code == CANCELLED:
                 self.status_var.set("已中断：没有写回任何帧（可在运行目录里续跑）")
             elif code == OK:
@@ -2235,6 +2769,15 @@ class App(ttk.Frame):
                         f"（{int(summary.get('battles', 0))} 场），最优 {int(summary.get('final', 0)):,}"
                         f"（{lineup_combo(team, toggles) if toggles and team else '—'}）"
                     )
+                elif zero:
+                    best = summary.get("best") or {}
+                    rounds_done = max(0, int(summary.get("rounds_done", 0)) - 1)
+                    self.status_var.set(
+                        f"完成：退火了 {rounds_done}/{int(summary.get('iterations', 0))} 轮"
+                        f"（{int(summary.get('battles', 0))} 场），最优 {int(float(best.get('damage') or 0)):,}"
+                    )
+                elif summary.get("mode") == "cycle":
+                    self.status_var.set(f"循环搜索完成，最高期望伤害 {summary['final']:,.0f}")
                 elif semantic:
                     settings = getattr(session, "settings", None) if session else None
                     planned = int(
@@ -2253,7 +2796,7 @@ class App(ttk.Frame):
                         f"完成：写回 {int(getattr(job, 'written', 0))} 项，结果轴已生成"
                     )
                 # 阵容结果轴里只有一支队伍，不当下一次搜索的输入（候选池在界面上，不用从轴上读）
-                if not roster:
+                if not roster and not zero:
                     workbook = getattr(session, "workbook", None) if session else None
                     if workbook is not None and Path(workbook).is_file():
                         self._load_result_axis(Path(workbook))
@@ -2280,7 +2823,7 @@ class App(ttk.Frame):
                 elif kind == "error":
                     self._append_log(f"[error] {payload}")
                     self.status_var.set("出错：见日志")
-                    messagebox.showerror(TITLE, f"调帧过程中出错：\n{payload}")
+                    self._report_error(f"调帧过程中出错：\n{payload}")
                     self._on_finished(-1)
                 elif kind == "icons":
                     done, total = payload
@@ -2288,13 +2831,12 @@ class App(ttk.Frame):
                     self.icon_status.configure(text=f"图标：{done} / {total}")
                 elif kind == "icons_done":
                     self.icon_status.configure(text=f"图标缓存：{_icon_dir_text()}")
-                    refresh, self._icon_refresh = self._icon_refresh, None
-                    if callable(refresh):
-                        try:
-                            refresh()
-                        except tk.TclError:  # 窗口已经关掉了
-                            pass
+                    for refresh in self._icon_refresh:
+                        refresh()
                 elif kind == "icons_pack":
+                    self._icons.clear()
+                    for refresh in self._icon_refresh:
+                        refresh()
                     self.icon_status.configure(text=f"图标包：已导入 {payload} 个")
                     self._append_log(f"图标包：已导入 {payload} 个图标到 {_icon_dir_text()}")
                 elif kind == "probe":
@@ -2304,11 +2846,11 @@ class App(ttk.Frame):
                     self.status_var.set("已列出这队的 32 种组合")
                 elif kind == "probe_error":
                     self._append_log(f"[error] 试这队失败：{payload}")
-                    messagebox.showerror(TITLE, f"试这队失败：\n{payload}")
+                    self._report_error(f"试这队失败：\n{payload}")
                 elif kind == "icons_error":
                     self.icon_status.configure(text="图标包：导入失败")
                     self._append_log(f"[error] 导入图标包失败：{payload}")
-                    messagebox.showerror(TITLE, f"导入图标包失败：\n{payload}")
+                    self._report_error(f"导入图标包失败：\n{payload}")
             except Exception as exc:  # noqa: BLE001 - keep the window alive
                 self.status_var.set(f"界面更新出错：{exc}")
         if self.session is not None:
@@ -2319,8 +2861,21 @@ class App(ttk.Frame):
         self.after(PUMP_MS, self._pump)
 
     def _refresh_progress(self, job) -> None:
+        if type(job).__name__ == "CycleJob":
+            self.progress.configure(value=len(job.history))
+            best = f"{job.best.metric:,.0f}" if job.best else "—"
+            self.counter_label.configure(text=f"已完成 {len(job.history)} 层 / {job.simulations} 场 / 最优 {best}")
+            while self.shown_history < len(job.history):
+                entry = job.history[self.shown_history]
+                self.shown_history += 1
+                self.result_tree.insert("", "end", values=("循环搜索", self.shown_history, "", "整场最优",
+                                                         f"{entry['damage']:,.0f}", entry["simulations"]))
+            return
         if getattr(job, "teams_total", None) is not None:  # 阵容搜索：一支一支队伍地排
             self._refresh_roster_progress(job)
+            return
+        if getattr(job, "rounds_total", None) is not None:  # 0 押轴：退火一轮一轮推进
+            self._refresh_zero_progress(job)
             return
         items = getattr(job, "items", None)
         if items is None:  # 语义 GA / 退火：按代或按迭代推进
@@ -2347,8 +2902,7 @@ class App(ttk.Frame):
         while self.shown_results < len(items):
             item = items[self.shown_results]
             self.shown_results += 1
-            frames = f"{text(item['old_raw'] if 'old_raw' in item else item['old_frame'])} → " \
-                     f"{text(item.get('new_frame', item['old_frame']))}"
+            frames = f"{item['old_frame']} → {item.get('new_frame') or item['old_frame']}"
             gain = ""
             if item.get("peak_metric") is not None:
                 gain = f"{item.get('baseline_metric', 0):,.0f} → {item['peak_metric']:,.0f}"
@@ -2378,6 +2932,32 @@ class App(ttk.Frame):
                     lineup_names(team, names),
                     lineup_combo(team, best.toggles),
                     f"{float(best.damage):,.0f}", getattr(job, "battles_done", ""),
+                ))
+        self.counter_label.configure(text=counter)
+
+    def _refresh_zero_progress(self, job) -> None:
+        """0 押轴：进度按退火轮数走，最优方案每刷新一次就往结果页补一行。"""
+        total = int(getattr(job, "rounds_total", 0) or 0)
+        done = int(getattr(job, "rounds_done", 0) or 0)
+        self.progress.configure(value=min(done, int(float(self.progress["maximum"]))))
+        best = getattr(job, "best", None)
+        counter = f"退火 {done}/{total} 轮 / 场次 {getattr(job, 'battles_done', 0)}"
+        if best is not None:
+            counter += f" / 最优 {float(best.damage):,.0f}"
+            plan = tuple(tuple(bool(flag) for flag in row) for row in getattr(best, "plan", ()))
+            if plan and plan != getattr(self, "shown_zero", ()):
+                from .roster import lineup_names
+                from .zero import plan_text
+
+                self.shown_zero = plan
+                units = tuple(getattr(job, "units", ()) or ())
+                names = getattr(job, "names", None) or {}
+                self.result_tree.insert("", "end", values=(
+                    f"{done}/{total}",
+                    lineup_names(units, names) if units else "",
+                    plan_text(plan), "",
+                    f"{float(best.damage):,.0f}",
+                    getattr(job, "battles_done", ""),
                 ))
         self.counter_label.configure(text=counter)
 
@@ -2417,12 +2997,24 @@ class App(ttk.Frame):
 
     LOG_LIMIT = 4000  # 界面里只留最近这么多行，完整日志在日志文件里
 
+    def _notice(self, message: str) -> None:
+        """提示只写界面日志，不弹窗。"""
+        self._append_log(str(message))
+
+    def _report_error(self, message: str) -> None:
+        """错误只写界面日志，不弹窗。"""
+        text = "；".join(part.strip() for part in str(message).splitlines() if part.strip())
+        self._append_log("错误：" + (text or "未知错误"))
+        self.status_var.set("出错：见日志")
+
     def _append_log(self, message: str) -> None:
+        follow = self.log_text.yview()[1] >= 0.999 or not self.log_text.winfo_ismapped()
         self.log_text.configure(state="normal")
         self.log_text.insert("end", f"{message}\n")
         if int(self.log_text.index("end-1c").split(".")[0]) > self.LOG_LIMIT:
             self.log_text.delete("1.0", f"{self.LOG_LIMIT // 4}.0")
-        self.log_text.see("end")
+        if follow:
+            self.log_text.see("end")
         self.log_text.configure(state="disabled")
 
     def _open_log_file(self, path: Path) -> None:
@@ -2447,14 +3039,14 @@ class App(ttk.Frame):
     def open_run_dir(self) -> None:
         run_dir = self._run_dir()
         if not run_dir or not Path(run_dir).is_dir():
-            messagebox.showinfo(TITLE, "还没有跑过，或运行目录已经不在。")
+            self._notice("还没有跑过，或运行目录已经不在。")
             return
         _open_path(Path(run_dir))
 
     def open_report(self) -> None:
         run_dir = self._run_dir()
         if not run_dir:
-            messagebox.showinfo(TITLE, "还没有跑过。")
+            self._notice("还没有跑过。")
             return
         report = Path(run_dir) / "报告.md"
         target = report if report.is_file() else Path(run_dir)
@@ -2469,13 +3061,13 @@ class App(ttk.Frame):
         run_dir = Path(folder)
         config_path = run_dir / CONFIG
         if not config_path.is_file():
-            messagebox.showerror(TITLE, f"{run_dir} 不是运行目录（缺少 {CONFIG}）")
+            self._report_error(f"{run_dir} 不是运行目录（缺少 {CONFIG}）")
             return
         try:
             config = read_json(config_path)
             excel = Path(str(config.get("excel") or ""))
             if not excel.is_file():
-                messagebox.showerror(TITLE, f"运行目录里记录的轴文件不在了：\n{excel}")
+                self._report_error(f"运行目录里记录的轴文件不在了：\n{excel}")
                 return
             state = read_json(run_dir / STATE) if (run_dir / STATE).is_file() else None
             self.open_axis(excel)
@@ -2485,7 +3077,13 @@ class App(ttk.Frame):
             spec = mode_registry.get(key)
             self.mode_var.set(dict(MODES).get(key, spec.label))
             self._sync_mode()
-            if key == mode_registry.GA:
+            if key == mode_registry.CYCLE:
+                stored = config.get("settings", {})
+                for name, var in self.cycle_vars.items():
+                    var.set(stored[name])
+                for name in ("battle_time", "seed", "samples", "batch_size", "timeout"):
+                    getattr(self, name + "_var").set(stored[name])
+            elif key == mode_registry.GA:
                 self._apply_ga_settings(GaSettings.from_dict(config.get("settings") or {}))
             elif key == mode_registry.ANNEAL:
                 from .anneal import AnnealSettings
@@ -2500,7 +3098,7 @@ class App(ttk.Frame):
                 search = SearchSettings.from_dict(config.get("search") or {})
                 self._apply_settings(settings, search)
         except (ValueError, OSError) as exc:
-            messagebox.showerror(TITLE, f"读不了这个运行目录：\n{exc}")
+            self._report_error(f"读不了这个运行目录：\n{exc}")
             return
         self._append_log(f"续跑 {run_dir}")
         self.start(resume_state=state, run_dir=run_dir)
@@ -2608,28 +3206,33 @@ def _fit_window(root: tk.Tk) -> None:
     root.geometry(f"{width}x{height}")
 
 
-def _window_icon() -> Path | None:
-    """窗口图标（任务栏 + 标题栏）：源码运行时找项目根的 icon.ico，冻结版找 exe 旁边的。"""
-    candidates = [
-        Path(getattr(sys, "_MEIPASS", "")) / "icon.ico" if getattr(sys, "_MEIPASS", "") else None,
-        Path(sys.executable).resolve().parent / "icon.ico" if getattr(sys, "frozen", False) else None,
-        Path(__file__).resolve().parents[2] / "icon.ico",
-    ]
-    for item in candidates:
-        if item is not None and item.is_file():
-            return item
-    return None
+def _set_window_icon(root: tk.Tk) -> None:
+    path = Path(__file__).with_name("app-icon.png")
+    image = tk.PhotoImage(master=root, file=str(path))
+    root.iconphoto(True, image)
+    root._app_icon = image
+    if sys.platform == "win32":
+        # Tk 可让系统自行补小图标；显式给两个 Windows 图标槽同一张原图。
+        import ctypes
+        from ctypes import wintypes
 
-
-def _set_window_icon(root: "tk.Tk") -> None:
-    icon = _window_icon()
-    if icon is None:
-        return  # 冻结版没放图标时 exe 自己是图标来源，这里不报错
-    try:
-        root.iconbitmap(str(icon))            # 当前窗口
-        root.iconbitmap(default=str(icon))    # 之后弹出的 Toplevel 也用它
-    except tk.TclError:
-        pass
+        user32 = ctypes.WinDLL("user32")
+        create = user32.CreateIconFromResourceEx
+        create.argtypes = [ctypes.c_void_p, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD,
+                           ctypes.c_int, ctypes.c_int, wintypes.UINT]
+        create.restype = wintypes.HICON
+        png = path.read_bytes()
+        icon = create(png, len(png), True, 0x30000, image.width(), image.height(), 0)
+        if icon:
+            user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+            user32.GetAncestor.restype = wintypes.HWND
+            user32.SendMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+            user32.DestroyIcon.argtypes = [wintypes.HICON]
+            root.update_idletasks()
+            hwnd = user32.GetAncestor(root.winfo_id(), 2)
+            for slot in (0, 1):
+                user32.SendMessageW(hwnd, 0x80, slot, icon)
+            root.bind("<Destroy>", lambda e: user32.DestroyIcon(icon) if e.widget is root else None, add="+")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -2638,6 +3241,9 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _attach_std_streams()
     log_path = _install_crash_handler()
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("PcrTimelineTester.Desktop")
     try:
         root = tk.Tk()
     except tk.TclError as exc:
@@ -2646,17 +3252,14 @@ def main(argv: list[str] | None = None) -> int:
     root.title(TITLE)
     _set_window_icon(root)
     root.minsize(880, GEOMETRY_HINT[1])
-    try:
-        root.call("tk", "scaling", 1.15)
-    except tk.TclError:
-        pass
     app = App(root, args.excel)
+    globals()["_LAST_APP"] = app  # 崩溃处理器要用它把错误写进界面日志
     root.protocol("WM_DELETE_WINDOW", app.on_close)
     _fit_window(root)
     app.apply_saved_geometry()
     try:
         root.mainloop()
-    except Exception as exc:  # 主循环里漏出来的异常：记日志 + 弹窗，别让窗口直接消失
+    except Exception as exc:  # 主循环里漏出来的异常：记日志，别让窗口直接消失
         sys.excepthook(type(exc), exc, exc.__traceback__)
         return 1
     return 0

@@ -140,6 +140,20 @@ def test_optimize_improves_and_skips_duplicates() -> None:
     assert state.simulations == len(seen)
 
 
+def test_unchanged_generation_reuses_checkpoint_scores() -> None:
+    seen = []
+    config = GAConfig(population=8, islands=2, generations=4, crossover=0, mutation=0,
+                      migration_interval=0, disaster_patience=0)
+    kwargs = dict(initial=EMPTY_GENOME, prefix=EMPTY_GENOME,
+                  pools=((0, 1),) * ROLE_COUNT, battle_time=90, config=config)
+    checkpoints = []
+    state = optimize(evaluator=_sum_evaluator(seen), on_checkpoint=checkpoints.append, **kwargs)
+    assert state.simulations == checkpoints[0].simulations == len(seen)
+    seen.clear()
+    assert optimize(evaluator=_sum_evaluator(seen), resume=checkpoints[1], **kwargs) == state
+    assert not seen
+
+
 def test_optimize_checkpoint_and_resume_are_deterministic() -> None:
     checkpoints: list[GenerationState] = []
     config = GAConfig(population=8, generations=4, islands=2, seed=11, fingerprint_distance=None)
@@ -255,7 +269,7 @@ def test_evaluator_request_contract(monkeypatch) -> None:
     first = body[0]
     assert first["IsSemanMode"] is True
     assert first["IsGuildBattle"] is True
-    assert first["NeedOnceResult"] is False
+    assert first["NeedOnceResult"] is True
     assert first["SemanUBExecTimeList"] == [[0], [0], [0], [0], [0]]
     assert first["UseSequenceUB"] is False and first["SemanUBSequenceData"] == []
     assert first["ActionProgressFrames"] == [10, 20]

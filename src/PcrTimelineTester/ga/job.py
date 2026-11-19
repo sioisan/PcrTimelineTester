@@ -93,6 +93,7 @@ class GaJob:
         self.export: dict | None = None
         self._resumed = False
         self.profile_detected = False
+        self.expected_damage = True
         # 轴自带的语义数据能不能原样还原成自己的帧轴（False 时起点改用帧轴推）
         self.semantic_usable = False
         self.frame_reference: int | None = None
@@ -118,6 +119,7 @@ class GaJob:
                 unit_ids=self.save.unit_ids,
                 log=self.log,
             )
+            self._evaluator.expected_damage = self.expected_damage
         return self._evaluator
 
     @property
@@ -301,7 +303,6 @@ class GaJob:
     # ------------------------------------------------------------------ 主流程
     def run(self) -> dict:
         started = time.perf_counter()
-        settings = self.settings
         if self.prepared is None:
             self.log("准备语义起点：把现有轴转换成语义 UB …")
             self.prepared = self._prepare()
@@ -309,6 +310,7 @@ class GaJob:
                 "语义起点："
                 + " / ".join(f"角色{index + 1} {len(lane)} 个 UB" for index, lane in enumerate(self.prepared.seed_lanes))
             )
+        settings = self.settings
         prepared = self.prepared
         self._check_cancel()
 
@@ -346,7 +348,7 @@ class GaJob:
 
         rounds = max(1, int(settings.restarts))
         resume_state = self.state
-        best_state = self.state
+        best_state = None
         for round_index in range(rounds):
             round_settings = (
                 settings if round_index == 0
@@ -364,6 +366,7 @@ class GaJob:
                 battle_time=settings.battle_time,
                 evaluator=self.evaluator.evaluate,
                 config=round_settings.ga_config(),
+                fixed_lengths=prepared.roles is not None,
                 resume=resume_state,
                 on_checkpoint=on_checkpoint,
             )
@@ -393,17 +396,6 @@ class GaJob:
         replay, frames = self.evaluator.replay(best_lanes, prepared.roles)
         self.log(f"导出前 replay：期望伤害 {replay.mean_damage:,} × 战斗帧 {replay.frames}")
         sequence = prepared.roles
-        if settings.conversion_profile.sequence_type is SemanSequenceType.SEQUENCE:
-            converted = self.evaluator.convert(frames)
-            if any(converted.lanes) and converted.sequence is not None:
-                verify, _ = self.evaluator.replay(converted.lanes, converted.sequence)
-                if verify.mean_damage != replay.mean_damage:
-                    self.log(
-                        f"[warn] 语义轴与帧轴不一致：语义 {converted.lanes} 评估 {verify.mean_damage:,}，"
-                        f"帧轴评估 {replay.mean_damage:,}；以帧轴为准"
-                    )
-            sequence = converted.sequence
-
         self.export = {
             "lanes": [list(lane) for lane in best_lanes],
             "sequence": list(sequence) if sequence is not None else None,
@@ -462,6 +454,8 @@ class GaJob:
     def state_dict(self) -> dict:
         return {
             "mode": "ga",
+            "expected_damage": self.expected_damage,
+            "profile": self.settings.conversion_profile.to_dict(),
             "prepared": None if self.prepared is None else self.prepared.to_dict(),
             "state": None if self.state is None else self.state.to_dict(),
             "history": list(self.history),
@@ -472,9 +466,19 @@ class GaJob:
     def apply_state(self, data: dict | None) -> None:
         if not data:
             return
+        # 旧任务按实战伤害排名，续跑时新旧候选必须使用同一口径。
+        self.expected_damage = bool(data.get("expected_damage", False))
         prepared = data.get("prepared")
         if prepared:
             self.prepared = GaPrepared.from_dict(prepared)
+            if data.get("profile"):
+                profile = SemanticConversionProfile.from_dict(data["profile"])
+                self.settings = replace(self.settings, ub_type=profile.ub_type, skill_type=profile.skill_type,
+                                        sequence_type=profile.sequence_type)
+                self.evaluator.profile = profile
+            else:
+                self._resolved_settings()
+            self.evaluator.roles = self.prepared.roles
         baseline = data.get("baseline")
         if baseline:
             self.baseline = Evaluation.from_dict(baseline)
@@ -483,6 +487,14 @@ class GaJob:
             self.state = GenerationState.from_dict(state)
         self.history = list(data.get("history") or [])
         self.rounds = list(data.get("rounds") or [])
+        if self.prepared and self.prepared.roles is not None and self.state:
+            counts = tuple(map(len, self.prepared.initial))
+            saved = [self.state.best, *(c for island in self.state.islands for c in island)]
+            if any(tuple(map(len, candidate.genome)) != counts for candidate in saved):
+                self.log("旧检查点中有候选刀数与角色顺序不符，本次沿用起点与基线重新搜索。")
+                self.state = None
+                self.history.clear()
+                self.rounds.clear()
         self.export = data.get("export")
         self._resumed = True
         if self.state is not None:

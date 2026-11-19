@@ -165,7 +165,7 @@ class ModeSpec:
 
     # ---- 便捷方法（前端只调这些）
     def read_save(self, path: Path, *, log: Callable[[str], None] | None = None) -> SaveFile:
-        return read_save(path, require_frames=self.needs_frames, log=log)
+        return read_save(path, require_frames=self.needs_frames, allow_empty=self.key == CYCLE, log=log)
 
     def defaults(self) -> dict[str, Any]:
         return {param.name: param.default for param in self.params}
@@ -616,4 +616,103 @@ register(ModeSpec(
     build=_roster_build,
     session=_roster_session,
     plan=_roster_plan,
+))
+
+
+# --------------------------------------------------------------------------- 0 押轴
+ZERO = "zero"
+
+ZERO_PARAMS: tuple[Param, ...] = (
+    Param("battle_time", "战斗秒数", "模拟战斗时长（1~90 秒）。", "int", 90, 1, 90),
+    Param("seed", "战斗种子", "固定随机种子（也决定退火怎么走）。", "int", 666, -(2 ** 31), 2 ** 31 - 1),
+    Param("samples", "采样种子数", "同一个方案评估几个种子取平均。", "int", 1, 1, 100),
+    Param("iterations", "退火轮数", "每轮并行提几个新方案、挑能接受的那个；1200 轮大约一两分钟。", "int", 1200, 1, 200000),
+    Param("batch", "每轮候选", "一轮里同时试几个方案（并发发请求，4 已经能喂满摸轴器）。", "int", 4, 1, 32),
+    Param("initial_temperature", "起始温度", "相对「单步伤害差」的比例，0.5 表示允许迈到差 50% 的一步。", "float", 0.5, 0, 100),
+    Param("final_temperature", "结束温度", "最后收尾时的比例，越小越只接受变好的方案。", "float", 0.01, 0, 100),
+    Param("ub_limit", "最多几刀", "每个角色最多排到第几刀（超出的刀沿用最后一刀的设定）。", "int", 12, 1, 24),
+    Param("timeout", "超时秒", "单次接口请求的超时时间。", "float", 180.0, 1, 3600),
+    Param("to_max_attr", "按满属性", "把这几个角色按满级满 Rank 算，否则沿用轴里的练度。", "bool", False),
+    Param("verify", "跑完复核", "导出前把最优方案再打一场确认伤害。", "bool", True),
+)
+
+
+def _zero_build(values: dict[str, Any], save: SaveFile):
+    from .zero import ZeroSettings
+
+    return ZeroSettings(
+        battle_time=int(values["battle_time"]),
+        seed=int(values["seed"]),
+        samples=int(values["samples"]),
+        iterations=int(values["iterations"]),
+        batch=int(values["batch"]),
+        initial_temperature=float(values["initial_temperature"]),
+        final_temperature=float(values["final_temperature"]),
+        ub_limit=int(values["ub_limit"]),
+        timeout=float(values["timeout"]),
+        to_max_attr=bool(values["to_max_attr"]),
+        verify=bool(values["verify"]),
+    )
+
+
+def _zero_session(save: SaveFile, settings, run_dir: Path, **kwargs: Any):
+    from .session import ZeroSession
+
+    return ZeroSession(save, settings, run_dir, **kwargs)
+
+
+def _zero_plan(save: SaveFile, settings) -> list[str]:
+    seeds = max(1, int(settings.samples))
+    units = tuple(int(unit) for unit in (getattr(save, "unit_ids", ()) or ()))
+    lines = []
+    if units:
+        lines.append("站位：" + ", ".join(f"{index + 1} {unit}" for index, unit in enumerate(units)))
+    lines += [
+        f"共 {int(settings.iterations)} 轮 × 每轮 {int(settings.batch)} 个候选 × {seeds} 个种子"
+        f" ≈ {int(settings.iterations) * int(settings.batch) * seeds} 场"
+        "（0 押：只在「TP 满了」的帧上决定按不按，O = 按、X = 交给 AUTO）",
+        f"每个角色最多排 {int(settings.ub_limit)} 刀（可排几刀跟着回包里的 TP 满帧条数走，刀数本来就会随打法变化）",
+        f"属性 {'满级满 Rank' if settings.to_max_attr else '沿用轴里的练度'}",
+    ]
+    return lines
+
+
+register(ModeSpec(
+    key=ZERO,
+    label="0押轴",
+    description="整场不打手动 UB，用退火逐刀决定每个角色这一刀是 O（SET）还是 X（AUTO），找伤害最高的打法。",
+    needs_frames=False,
+    workbook_name="0押结果.xlsx",
+    params=ZERO_PARAMS,
+    build=_zero_build,
+    session=_zero_session,
+    plan=_zero_plan,
+))
+
+# --------------------------------------------------------------------------- 循环搜索
+CYCLE = "cycle"
+
+
+def _cycle_build(values, save):
+    from .cycle import CycleSettings
+    return CycleSettings(**values)
+
+
+def _cycle_session(save, settings, run_dir, **kwargs):
+    from .cycle import CycleSession
+    return CycleSession(save, settings, run_dir, **kwargs)
+
+
+CYCLE_PARAMS = (
+    Param("depth", "搜索层数", "允许连续改动几步，每层重新读取事件。", "int", 4, 1, 100),
+    Param("width", "保留分支", "每层保留多少种循环继续探索。", "int", 4, 1, 32),
+    Param("candidates", "每支候选", "每个分支最多测试几种新操作。", "int", 64, 4, 1024),
+)
+register(ModeSpec(
+    key=CYCLE, label="循环搜索", description="按实际充能、跳伤和动作循环增删 UB，保留多步联动分支。",
+    needs_frames=False, workbook_name="循环搜索结果.xlsx",
+    params=CYCLE_PARAMS + tuple(p for p in FRAME_PARAMS if p.name in
+                                ("battle_time", "seed", "samples", "batch_size", "timeout")),
+    build=_cycle_build, session=_cycle_session,
+    plan=lambda save, s: [f"连续搜索 {s.depth} 层，每层保留 {s.width} 个分支，每支最多试 {s.candidates} 条轴。"],
 ))

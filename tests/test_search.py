@@ -109,6 +109,15 @@ def test_sample_failure_aborts_instead_of_counting_zero() -> None:
         run(settings, 470, landscape(470), book, log=lambda _: None)
 
 
+def test_tolerance_preserves_the_actual_damage_of_the_selected_frame() -> None:
+    settings = SearchSettings(step=1, max_offset=3, peak_tolerance=0.5)
+    damage = {499: 1000.8, 500: 1000.0, 501: 1001.0}
+    metric = lambda frame: damage.get(frame, 1.0)
+    result = run(settings, 500, metric(500), make_book(metric, settings), log=lambda _: None)
+    assert result.peak_frame == 499
+    assert result.peak_metric == metric(499)
+
+
 def test_number_formatting() -> None:
     assert fmt(1234567.0) == "1,234,567"
     assert fmt(0.5) == "0.5"

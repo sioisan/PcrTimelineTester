@@ -344,6 +344,7 @@ def parse_save(
     *,
     names: dict[int, str] | None = None,
     require_frames: bool = True,
+    allow_empty: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> SaveFile:
     """Validate a decoded timeline save and pull out the axes.
@@ -375,7 +376,7 @@ def parse_save(
         frames = frame_axis(raw["UBExecTime"], "UBExecTime")
     semantic = semantic_axis(group.get("SemanUBExecTimeData") or [], log=log)
     sequence = sequence_axis(group.get("SemanUBSequenceData"), semantic) if semantic else None
-    if (not frames or not any(frames)) and not semantic:
+    if (not frames or not any(frames)) and not semantic and not allow_empty:
         raise ValueError(
             "这条轴里既没有帧数据也没有语义 UB 数据。请确认导出的是 PCRCalculator 的轴（savePage 页）"
         )
@@ -396,6 +397,7 @@ def read_save(
     path: Path,
     *,
     require_frames: bool = True,
+    allow_empty: bool = False,
     log: Callable[[str], None] | None = None,
 ) -> SaveFile:
     """Read any PCRCalculator exported ``.xlsx`` timeline."""
@@ -416,7 +418,7 @@ def read_save(
         raise ValueError(f"无法读取 Excel 的 {SAVE_SHEET} 轴数据，文件 {path.name}，{exc}") from exc
     return parse_save(
         path, raw, str(header or SAVE_SHEET), names=read_names(path),
-        require_frames=require_frames, log=log,
+        require_frames=require_frames, allow_empty=allow_empty, log=log,
     )
 
 

@@ -204,7 +204,8 @@ def _fired(
     frame: int,
 ) -> bool | None:
     """这一帧上目标 UB 到底放出来了没有（None = 不知道，别据此下结论）。"""
-    if ub_row < 0 or ub_of(frame) is None:
+    rows = ub_of(frame)
+    if ub_row < 0 or not rows or ub_row >= len(rows):
         return None
     actual = _actual_ub(ub_of, ub_row, ub_index, frame)
     return actual is not None and abs(actual - frame) <= UB_FRAME_TOLERANCE
@@ -249,7 +250,7 @@ class MetricBook:
                 missing.append(frame)
         if not missing:
             return
-        if self.settings.max_battles and self.battles >= self.settings.max_battles:
+        if self.settings.max_battles and self.battles + len(missing) > self.settings.max_battles:
             raise SearchAbort(f"达到场次上限 {self.settings.max_battles}，搜索中止（请缩小偏移/步长）")
         metrics = self.fetch(missing, tag)
         if len(metrics) != len(missing):
@@ -322,13 +323,36 @@ def run(
 
     def walk(frames: list[int], tag: str) -> Iterator[tuple[int, float]]:
         ordered = [frame for frame in frames if settings.frame_min <= frame <= settings.frame_max]
-        for start in range(0, len(ordered), settings.chunk):
-            block = ordered[start:start + settings.chunk]
+        size = settings.chunk
+        if tag in ("fillL", "fillR") and settings.memoize:
+            # 粗探已经测过的低点一定会结束补齐，不必预发越过它的场次。
+            cutoff = max(result.visited.values()) - settings.peak_tolerance
+            for index, frame in enumerate(ordered):
+                if frame in book.cache and book.get(frame) < cutoff:
+                    ordered = ordered[:index + 1]
+                    break
+            # 左侧刚出现放不出 UB 的帧时，通常第一步就能确定边界。
+            if tag == "fillL" and any(_fired(book.ub_of, ub_row, ub_index, f) is False
+                                      for f in ordered[:settings.step]):
+                size = 1
+        downward = ub_row >= 0 and tag in ("down", "downouter", "fillL")
+        misses = 0
+        limit = min(UB_MISS_LIMIT, settings.outer_probes)
+        start = 0
+        while start < len(ordered):
+            room = min(size, limit + 1 - misses) if downward else size
+            block = ordered[start:start + room]
+            start += len(block)
+            size = min(settings.chunk, size * 2)
             book.block(block, tag)
             for frame in block:
                 metric = book.get(frame)
                 result.visited[frame] = metric
                 yield frame, metric
+                if downward:
+                    misses = misses + 1 if _fired(book.ub_of, ub_row, ub_index, frame) is False else 0
+                    if misses > limit:
+                        return
 
     try:
         peak_frame, peak_metric = _probe(
@@ -419,6 +443,7 @@ def _probe(
         return False
 
     stop_down = False
+    blocked_frame = None
     while safety < 400:
         safety += 1
         if cancelled():
@@ -428,6 +453,7 @@ def _probe(
             if metric > peak_metric:
                 peak_metric, peak_frame = metric, frame
             if cannot_fire(frame):
+                blocked_frame = frame
                 stop_down = True
                 break
             if not settings.acceptable(baseline_metric, metric):
@@ -451,6 +477,7 @@ def _probe(
                 log(f"⑤ 外探发现更高值：{frame}→{fmt(metric)}，换峰值回到④")
                 break
             if cannot_fire(frame):
+                blocked_frame = frame
                 stop_down = True
                 break
         if stop_down or not found:
@@ -459,9 +486,8 @@ def _probe(
     # ⑥⑦ fill both sides of the peak frame by frame
     fill_cap = settings.max_offset + (settings.outer_probes + 2) * max(1, step)
     log(f"⑥ 峰值 {peak_frame} 左侧逐帧补齐")
-    count = 0
-    for frame, metric in walk(list(range(peak_frame - 1, settings.frame_min - 1, -1))[:fill_cap], "fillL"):
-        count += 1
+    left = max(settings.frame_min, peak_frame - fill_cap, blocked_frame or settings.frame_min)
+    for frame, metric in walk(list(range(peak_frame - 1, left - 1, -1)), "fillL"):
         if metric > peak_metric:
             peak_metric, peak_frame = metric, frame
         if metric + settings.peak_tolerance < peak_metric:
@@ -469,9 +495,8 @@ def _probe(
         if cannot_fire(frame):
             break
     log(f"⑦ 峰值 {peak_frame} 右侧逐帧补齐")
-    count = 0
-    for frame, metric in walk(list(range(peak_frame + 1, settings.frame_max + 1))[:fill_cap], "fillR"):
-        count += 1
+    right = min(settings.frame_max, peak_frame + fill_cap)
+    for frame, metric in walk(list(range(peak_frame + 1, right + 1)), "fillR"):
         if metric > peak_metric:
             peak_metric, peak_frame = metric, frame
         if metric + settings.peak_tolerance < peak_metric:
@@ -493,17 +518,15 @@ def _finalise(
     visited = result.visited
     if not visited:
         return
-    best_metric = max(visited.values())
-    inside = [
-        frame for frame, metric in visited.items()
-        if abs(metric - best_metric) < settings.peak_tolerance
-    ]
-    fired_inside = [frame for frame in inside if fired(frame) is not False]
-    if fired_inside:
-        inside = fired_inside
-    if inside:
-        result.peak_frame = min(inside)
-        result.peak_metric = best_metric
+    eligible = [frame for frame in visited if fired(frame) is not False] or list(visited)
+    best_metric = max(visited[frame] for frame in eligible)
+    # 容差内可取更早帧，但不能给它记上另一帧的伤害，也不能因此退步。
+    floor = min(result.baseline_metric, best_metric)
+    result.peak_frame = min(
+        frame for frame in eligible
+        if visited[frame] >= floor and best_metric - visited[frame] <= settings.peak_tolerance
+    )
+    result.peak_metric = visited[result.peak_frame]
     within = [
         frame for frame, metric in visited.items()
         if settings.acceptable(result.baseline_metric, metric)

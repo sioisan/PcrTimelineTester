@@ -16,7 +16,7 @@ from PcrTimelineTester.search import ThresholdMode
 
 
 def test_builtin_modes_are_registered():
-    assert modes.keys() == ("frame", "ga", "anneal", "roster")
+    assert modes.keys() == ("frame", "ga", "anneal", "roster", "zero", "cycle")
     assert modes.get("frame").needs_frames is True
     assert modes.get("ga").needs_frames is False
     assert modes.get("ga").workbook_name == "优化结果.xlsx"
@@ -24,11 +24,15 @@ def test_builtin_modes_are_registered():
     assert modes.get("anneal").workbook_name == "退火结果.xlsx"
     assert modes.get("roster").needs_frames is False
     assert modes.get("roster").workbook_name == "阵容结果.xlsx"
+    assert modes.get("zero").needs_frames is False
+    assert modes.get("zero").workbook_name == "0押结果.xlsx"
     assert modes.labels() == (
         ("frame", "逐帧搜索"),
         ("ga", "语义 GA"),
         ("anneal", "退火"),
         ("roster", "阵容搜索"),
+        ("zero", "0押轴"),
+        ("cycle", "循环搜索"),
     )
 
 

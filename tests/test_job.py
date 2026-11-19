@@ -158,3 +158,45 @@ def test_job_walks_the_items_in_frame_order(tmp_path) -> None:
     )
     assert [target.frame for target in job.targets] == [100, 500, 700, 800, 900]
     assert [target.row for target in job.targets][0] == 1
+
+
+def test_joint_search_crosses_two_losing_single_moves_and_resumes(tmp_path):
+    save = make_save(tmp_path, [[500], [505], [820], [], []])
+    def damage(table):
+        pair = table[0][0], table[1][0]
+        return 120 if pair == (501, 506) else 100 if pair == (500, 505) else 90
+    client = FakeClient(damage)
+    selected = JobSettings(items=frozenset({(1, 1), (2, 1)}))
+    job = TuneJob(save, selected, SEARCH, client=client, log=lambda _: None)
+    # 在首批联动成绩出来后停止，保留尚未采纳的联合最高分和下一批位置。
+    class StopAfterBatch(FakeClient):
+        def evaluate(self, candidates):
+            scores = super().evaluate(candidates)
+            if any(score.metric == 120 for score in scores):
+                job.cancel()
+            return scores
+    job._client = StopAfterBatch(damage)
+    assert job.run()["cancelled"]
+    state = job.state()
+    assert state["effect_progress"]["metric"] == 120
+    resumed = TuneJob(save, selected, SEARCH, client=client, log=lambda _: None)
+    resumed.apply_state(state)
+    result = resumed.run()
+    assert result["final"]["metric"] == 120
+    assert resumed.frames == [[501], [506], [820], [], []]
+    assert sum(a.new_metric - a.old_metric for a in resumed.accepted) == 20
+
+
+def test_effect_events_and_same_frame_order():
+    from PcrTimelineTester.effects import effect_frames, proposals
+    from PcrTimelineTester.frames import build_targets
+    frames = [[501.001], [501], [], [], []]
+    targets = build_targets(frames, list(range(5)))
+    events = effect_frames({"HitTraceEvents": [{"SourceUnitId": 0, "Frame": 505}],
+                            "BuffDebuffEvents": [{"TargetUnitId": 1, "StartFrame": 400, "EndFrame": 490}],
+                            "BossDefEvents": [{"Frame": 510}]}, list(range(5)))
+    assert events[:2] == [{505, 510}, {400, 490, 510}]
+    a, b = targets
+    edits = list(proposals(frames, a, b, events, SEARCH))
+    assert all(((a, v),) in edits for v in (504.001, 505.001, 506.001))
+    assert ((a, 501), (b, 501.001)) in edits

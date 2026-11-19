@@ -193,6 +193,16 @@ def test_job_runs_and_exports_the_best(tmp_path) -> None:
     assert evaluator.closed is False  # close() 由会话负责
 
 
+def test_neighbor_batches_respect_the_candidate_budget(tmp_path) -> None:
+    evaluator = FakeEvaluator()
+    job = AnnealJob(_save(tmp_path), _settings(iterations=17, batch_size=3), evaluator=evaluator, log=lambda _: None)
+    job.run()
+    batches = [size for method, size in evaluator.calls if method == "evaluate"]
+    assert max(batches) == 3
+    assert sum(batches) <= 17
+    assert len(set(evaluator.requested)) == sum(batches)
+
+
 def test_job_cancel_writes_no_export(tmp_path) -> None:
     save = _save(tmp_path)
     job = AnnealJob(save, _settings(), log=lambda _message: None, evaluator=FakeEvaluator())
@@ -295,3 +305,17 @@ def test_anneal_mode_is_registered_and_round_trips(tmp_path) -> None:
     assert spec.values(settings) == values
     with pytest.raises(ValueError):
         spec.from_values({**values, "不存在的参数": 1}, save)
+
+
+def test_chain_can_change_ub_counts_unless_role_sequence_is_fixed():
+    genome = ((1,), (), (2,), (), ())
+    pools = ((1, 2, 3),) * 5
+    rng = random.Random(15)
+    settings = _settings()
+    results = [mutate(genome, pools, settings, rng, operator="chain")[0] for _ in range(160)]
+    assert any(sum(map(len, result)) > 2 for result in results)
+    assert any(sum(map(len, result)) < 2 for result in results)
+    assert any(result[1] for result in results)
+    for _ in range(160):
+        result, _ = mutate(genome, pools, settings, rng, operator="chain", fixed_lengths=True)
+        assert list(map(len, result)) == list(map(len, genome))

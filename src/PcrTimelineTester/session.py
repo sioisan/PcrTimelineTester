@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from .frames import text
 from .job import JobSettings, TuneJob
@@ -563,6 +563,182 @@ class RosterSession:
         self.log(f"日志 {self.run_dir / LOG}")
         return OK
 
+
+    # ------------------------------------------------------------------ 收尾
+    def close(self) -> None:
+        self.job.close()
+
+
+# --------------------------------------------------------------------------- 0 押轴
+def zero_workbook_summary(summary: dict, *, names: dict[int, str] | None = None) -> list[list[Any]]:
+    """0 押轴的结果表：最优的逐刀 O/X 设定 + 刷新记录。"""
+    names = names or {}
+    best = summary.get("best") or {}
+    units = [int(unit) for unit in (summary.get("units") or [])]
+    rows: list[list[Any]] = [
+        ["PCR 0押轴结果", summary.get("excel")],
+        ["优化模式", "0押轴（不打手动 UB，退火逐刀决定 O=SET / X=AUTO）"],
+        [
+            "接口",
+            f"{summary.get('endpoint')}（{summary.get('battle_time')} 秒 / 种子 {summary.get('seed')}）",
+        ],
+        ["站位", lineup_names(tuple(units), names) if units else ""],
+        [
+            "退火规模",
+            f"{int(summary.get('iterations') or 0)} 轮 × 每轮 {int(summary.get('batch') or 0)} 个候选 × "
+            f"{max(1, int(summary.get('samples') or 1))} 个种子；实际模拟 "
+            f"{int(summary.get('battles') or 0):,} 场",
+        ],
+        ["最多几刀", f"每个角色最多排 {int(summary.get('ub_limit') or 0)} 刀（实际刀数跟着回包的 TP 满帧走）"],
+        [
+            "基线",
+            "纯 SET {} ／ 纯 AUTO {}".format(
+                _number_text((summary.get("baseline") or {}).get("set_damage")),
+                _number_text((summary.get("baseline") or {}).get("auto_damage")),
+            ),
+        ],
+        [
+            "TP 满帧",
+            "、".join(
+                "{} {}".format(index + 1, len(row))
+                for index, row in enumerate(summary.get("opportunities") or ())
+            ) or "",
+        ],
+        ["属性", "满级满 Rank" if summary.get("to_max_attr") else "沿用轴里的练度"],
+        ["最优期望伤害", _number_text(best.get("damage"))],
+        ["战斗帧 / 结果", f"{int(best.get('frames') or 0)} / {_result_text(best.get('result'))}"],
+        [],
+        ["站位", "角色", "逐刀设定（O=SET、X=AUTO）"],
+    ]
+    plan = best.get("plan") or []
+    for index, unit in enumerate(units):
+        flags = plan[index] if index < len(plan) else []
+        body = "".join("O" if flag else "X" for flag in flags) or "O"
+        tail = "O" if (flags[-1] if flags else True) else "X"
+        rows.append([f"{index + 1}", names.get(unit, str(unit)), f"{body}（之后一律 {tail}）"])
+    rows.append([])
+    rows.append(["刷新记录", "轮次", "逐刀设定", "期望伤害"])
+    for item in summary.get("history") or ():
+        rows.append(
+            [
+                "",
+                int(item.get("round") or 0),
+                item.get("text") or "",
+                _number_text(item.get("damage")),
+            ]
+        )
+    rows.append([])
+    rows.append(
+        [
+            "说明",
+            "本文件由 PcrTimelineTester 生成；轴本身没有手动 UB，导入后请按上表逐刀设置 O（能按就按）/ X（交给自动）。",
+        ]
+    )
+    rows.append(["生成时间", time.strftime("%Y-%m-%d %H:%M:%S")])
+    return rows
+
+
+def _lineup_or_blank(units: Sequence[int], flags: Sequence[bool], names: dict[int, str] | None) -> str:
+    if not units or not flags:
+        return ""
+    return lineup_text(units, flags, names or {})
+
+
+def _result_text(value: Any) -> str:
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return ""
+    return {0: "胜利", 1: "失败", 2: "超时", 3: "撤退"}.get(result, str(result))
+
+
+class ZeroSession:
+    """0 押轴的会话：结果轴保持原样，只加一页「0押结果」。"""
+
+    workbook_name = "0押结果.xlsx"
+
+    def __init__(
+        self,
+        save: SaveFile,
+        settings: "ZeroSettings",
+        run_dir: Path,
+        *,
+        log: Callable[[str], None] = print,
+        resume_state: dict | None = None,
+        evaluator: Any = None,
+        names: dict[int, str] | None = None,
+    ) -> None:
+        from .zero import ZeroJob
+
+        self.save = save
+        self.settings = settings
+        self.run_dir = Path(run_dir)
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.log = log
+        self.summary: dict = {}
+        self.workbook: Path | None = None
+        self.names = dict(names or getattr(save, "names", None) or {})
+        write_json(self.run_dir / CONFIG, {
+            "excel": str(save.path),
+            "mode": "zero",
+            "settings": settings.to_dict(),
+            "header": save.header,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        self.job = ZeroJob(save, settings, log=log, evaluator=evaluator)
+        self.job.names = dict(self.names)
+        if resume_state:
+            self.job.apply_state(resume_state)
+
+    # ---------------------------------------------------------------- control
+    def cancel(self) -> None:
+        self.job.cancel_run()
+
+    @property
+    def cancelled_requested(self) -> bool:
+        return self.job.cancelled_requested
+
+    @property
+    def log_path(self) -> Path:
+        return self.run_dir / LOG
+
+    @property
+    def report_path(self) -> Path:
+        return self.run_dir / REPORT_MD
+
+    # --------------------------------------------------------------------- run
+    def run(self) -> int:
+        from .report import write_zero_report
+
+        started = time.perf_counter()
+        summary = self.job.run()
+        summary["elapsed"] = round(time.perf_counter() - started, 1)
+        summary["run_dir"] = str(self.run_dir)
+        self.summary = summary
+        write_json(self.run_dir / STATE, self.job.state_dict())
+        cancelled = bool(summary.get("cancelled"))
+        write_json(self.run_dir / REPORT_JSON, summary)
+        write_zero_report(self.run_dir / REPORT_MD, summary, names=self.names)
+        if cancelled:
+            self.log("已停止：没有导出任何结果。")
+            self.log(f"续跑：PcrTimelineTester resume \"{self.run_dir}\"")
+            return CANCELLED
+        workbook = self.run_dir / self.workbook_name
+        write_tuned_save(
+            workbook, self.save, self.save.frames,
+            battle_seed=self.settings.seed,
+            damage=int((summary.get("best") or {}).get("damage") or 0),
+            summary=zero_workbook_summary(summary, names=self.names),
+            sheet_name="0押结果",
+        )
+        summary["result_workbook"] = str(workbook)
+        self.workbook = workbook
+        write_json(self.run_dir / REPORT_JSON, summary)
+        write_zero_report(self.run_dir / REPORT_MD, summary, names=self.names)
+        self.log(f"结果轴 {workbook}")
+        self.log(f"报告 {self.run_dir / REPORT_MD}")
+        self.log(f"日志 {self.run_dir / LOG}")
+        return OK
 
     # ------------------------------------------------------------------ 收尾
     def close(self) -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass, field, replace
 
 from .engine import GAConfig
 from .semantics import (
+    DEFAULT_MAX_LANE_LENGTH,
     EMPTY_GENOME,
     ROLE_COUNT,
     Genome,
@@ -52,7 +53,7 @@ class GaSettings:
     migration_interval: int = 10
     migrants_ratio: float = 0.08
     disaster_patience: int = 20
-    max_lane_length: int = 96
+    max_lane_length: int = DEFAULT_MAX_LANE_LENGTH
     fingerprint_distance: float | None = 1.0
     ga_seed: int = 42
     # 语义转换
