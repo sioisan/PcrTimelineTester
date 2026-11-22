@@ -24,13 +24,33 @@ import httpx
 
 from .client import TuneError, _expected_damage, simulation_url
 from .datas import unit_width
-from .savefile import SaveFile
+from .savefile import SaveFile, UNIT_FIELDS, frame_axis
 
 ROLE_KEYS = ("unitId", "level", "rarity", "rank", "equipLevel", "skillLevel")
 DEFAULT_ENDPOINT = "http://127.0.0.1:8080/simulate"
 TEAM_SIZE = 5
 POST_WORKERS = 4  # 同时发几个请求（服务端本身是多线程的，串行发吃不满 CPU）
 RESULT_LIMIT = 100
+LABYRINTH_EX = "武器 20 贯通、防具 12 贯通、首饰 8% 攻击"
+
+
+def labyrinth_equipment(player: dict) -> dict:
+    """算器返回该角色可穿的三个类别，按装备表选择有目标词条的虹装。"""
+    slots = player.get("exEquip")
+    if not isinstance(slots, list) or len(slots) != 3 or not all(type(i) is int for i in slots):
+        raise TuneError(f"算器缺少角色 {player.get('unitId')} 的 EX 装备类别")
+    weapon, armor, accessory = (i // 1000 for i in slots)
+    if not (4101 <= weapon <= 4110 and 4201 <= armor <= 4204 and 4301 <= accessory <= 4305):
+        raise TuneError(f"角色 {player.get('unitId')} 的 EX 装备类别无法匹配黎明配装：{slots}")
+    # 四条满档词条。首饰的物攻在索引 1，魔攻在索引 2。
+    atk_index = 1 if accessory <= 4303 else 2
+    return {
+        "exEquip": [weapon * 1000 + 511, armor * 1000 + (503 if armor == 4201 else 501),
+                    accessory * 1000 + 514],
+        "exEquipLevel": [0, 0, 0],
+        "exEquipExceedRank": [0, 5 if armor == 4201 else 0, 5],
+        "exEquipSubs": {"0": [5, 4] * 4, "1": [5, 4] * 4, "2": [atk_index, 4] * 4},
+    }
 
 
 class RosterCancelled(RuntimeError):
@@ -351,6 +371,8 @@ class TeamEvaluator:
         self.battles = 0
         self._client = httpx.Client(timeout=float(settings.timeout))
         self._template = [dict(player) for player in save.players]
+        self._originals = {player["unitId"]: player for player in save.players}
+        self._max_players: dict[int, dict] = {}
         self._context = save.request_context(battle_time=int(settings.battle_time), battle_seed=int(settings.seed))
         self.expected_damage = True
 
@@ -366,13 +388,41 @@ class TeamEvaluator:
 
     # -------------------------------------------------------- 组请求
     def team_players(self, units: Sequence[int]) -> list[dict]:
+        if self.save.is_labyrinth:
+            self._prepare_labyrinth_players(units)
         players = []
         for index, unit in enumerate(units):
             template = self._template[index % len(self._template)]
             player = {key: template[key] for key in ROLE_KEYS if key in template}
             player["unitId"] = int(unit)
+            if self.save.is_labyrinth:
+                trained = self._max_players[unit]
+                if self.settings.to_max_attr:
+                    player = trained
+                else:
+                    player = dict(self._originals.get(unit, player))
+                    player.update({key: value for key, value in trained.items() if key.startswith("exEquip")})
             players.append(player)
         return players
+
+    def _prepare_labyrinth_players(self, units) -> None:
+        missing = [unit for unit in dict.fromkeys(units) if unit not in self._max_players]
+        for start in range(0, len(missing), TEAM_SIZE):
+            team = missing[start:start + TEAM_SIZE]
+            team = list(dict.fromkeys([*team, *self.save.unit_ids]))[:TEAM_SIZE]
+            body = dict(self._context, PlayerList=[{"unitId": unit} for unit in lineup_order(team)],
+                        BattleTime=1, ToMaxUnitAttr=True, CalcStats=1, NeedOnceResult=True,
+                        IsSkipping=True, UBExecTimeList=[], IsAutoMode=True, SetToggles=[False] * TEAM_SIZE)
+            reply = self._fetch([body])[0]
+            self._item(reply, body, 0)
+            profiles = reply.get("PlayerList")
+            if (not isinstance(profiles, list) or len(profiles) != TEAM_SIZE
+                    or any(not isinstance(p, dict) for p in profiles)
+                    or {p.get("unitId") for p in profiles} != set(team)):
+                raise TuneError("算器没有返回该队五人的练度与 EX 装备")
+            for profile in profiles:
+                player = {key: profile[key] for key in UNIT_FIELDS if key in profile}
+                self._max_players[player["unitId"]] = {**player, **labyrinth_equipment(player)}
 
     def combos(self, size: int = TEAM_SIZE) -> list[tuple[bool, ...]]:
         """一支队伍要试的 AUTO / SET 组合。
@@ -406,7 +456,7 @@ class TeamEvaluator:
             PlayerList=self.team_players(order),
             CalcStats=1,
             IsSkipping=True,
-            ToMaxUnitAttr=bool(self.settings.to_max_attr),
+            ToMaxUnitAttr=bool(self.settings.to_max_attr and not self.save.is_labyrinth),
             # 轴里的帧是「帧模式」的手动刀表，不是 AUTO / SET，阵容搜索一律不带
             UBExecTimeList=[],
             SemanUBExecTimeList=[],
@@ -441,6 +491,8 @@ class TeamEvaluator:
             else self.combos(TEAM_SIZE)
         )
         seeds = self.settings.seeds()
+        if self.save.is_labyrinth:
+            self._prepare_labyrinth_players(itertools.chain.from_iterable(teams))
         for index, team in enumerate(teams):
             for combo in combos:
                 plans.append((index, combo))
@@ -498,6 +550,26 @@ class TeamEvaluator:
             results.append((combo, TeamScore(damage, frames, worst, combo)))
         results.sort(key=lambda item: -int(item[1].damage))
         return results
+
+    def labyrinth_result_save(self, team: Sequence[int], toggles: Sequence[bool]) -> SaveFile:
+        """把首种子的实放帧和同场角色写入结果轴，避免沿用换人前的刀表。"""
+        from copy import deepcopy
+
+        body = self.request_for(team, toggles=toggles)
+        body["CalcStats"] = 3
+        reply = self._fetch([body])[0]
+        self._item(reply, body, 0)
+        frames = frame_axis(reply["Stats"].get("UBTime"), "阵容实放 UB")
+        if len(frames) < TEAM_SIZE:
+            raise TuneError("算器没有返回黎明阵容的五条实放 UB 记录")
+        players = deepcopy(body["PlayerList"])
+        raw = deepcopy(self.save.raw)
+        group = raw["playerGroupData"]
+        group["playerData"]["playrCharacters"] = players
+        group["SemanUBExecTimeData"] = []
+        group["SemanUBSequenceData"] = []
+        raw.pop("exequipImages", None)
+        return replace(self.save, raw=raw, players=players, frames=frames, semantic=[], sequence=None)
 
     def _post(self, requests: list[dict]) -> list[dict]:
         """按 batch_size 拆成若干批并行发（POST_WORKERS 个），回包顺序与请求一致。"""
@@ -684,6 +756,8 @@ class RosterJob:
         seeds = max(1, int(self.settings.samples))
         total_battles = self.teams_total * combos * seeds
         self.log(f"=== 阵容搜索：共 {self.teams_total} 支队伍 × {combos} 种 AUTO/SET × {seeds} 个种子 = {total_battles} 场 ===")
+        if self.save.is_labyrinth:
+            self.log(f"黎明界 EX 配装：{LABYRINTH_EX}")
         for group in self.settings.groups:
             if group.members:
                 self.log(f"分组 {group.label}：{','.join(str(unit) for unit in group.members)}")
@@ -849,6 +923,7 @@ class RosterJob:
             "mode": "roster",
             "cursor": int(self.teams_done),
             "enumeration_version": 2,
+            "labyrinth_ex": LABYRINTH_EX if self.save.is_labyrinth else None,
             "expected_damage": self.expected_damage,
             "teams": list(self.results),
             "battles": int(self.battles_done),
@@ -859,6 +934,9 @@ class RosterJob:
         }
 
     def apply_state(self, data: dict) -> None:
+        if self.save.is_labyrinth and data.get("labyrinth_ex") != LABYRINTH_EX:
+            self.log("旧进度使用了不同的黎明界配装，将从第一队重新评分。")
+            return
         if fixed_groups(self.settings) and data.get("enumeration_version") != 2:
             self.log("旧版分组进度使用了不同的枚举顺序，本次将重新遍历符合最少人数的队伍。")
             return

@@ -491,6 +491,7 @@ class App(ttk.Frame):
         self.worker: threading.Thread | None = None
         self.events: queue.Queue = queue.Queue()
         self.roster_results: list[dict] = []
+        self.roster_source = None
         self.shown_team: tuple[int, ...] = ()
         self._probe_team: tuple | None = None
         self.targets: list = []
@@ -1086,7 +1087,7 @@ class App(ttk.Frame):
         row = 3
         full = ttk.Checkbutton(roster, text="按满属性算", variable=self.to_max_attr_var)
         full.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self._hint(full, "勾上就把这几个角色按满级满 Rank 算（不同练度的角色才能直接比）；不勾就沿用轴里的练度。")
+        self._hint(full, "勾选后按满级满 Rank 计算。黎明界在两种练度下都使用武器 20 贯通、防具 12 贯通、首饰 8% 攻击。")
         combos = ttk.Checkbutton(roster, text="每队试 32 种 AUTO/SET", variable=self.every_combo_var)
         combos.grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
         self._hint(combos, "每支队伍都把「每个人 AUTO / SET」的 2^5 种组合各打一遍取最高；"
@@ -1606,7 +1607,7 @@ class App(ttk.Frame):
                 settings = self._roster_settings()
                 # 这个按钮就是「32 种都试」，不看「每队试 32 种」那个勾选
                 settings = dataclasses.replace(settings, every_combo=True)
-                save = self.save
+                save = self.roster_source or self.save
                 if save is None:
                     raise ValueError("先打开一条轴（结果里的队伍要照抄轴里的角色属性）。")
                 names = self._roster_names()
@@ -2753,6 +2754,7 @@ class App(ttk.Frame):
             summary = getattr(session, "summary", None) or {}
             if summary.get("teams"):
                 self.roster_results = [dict(item) for item in summary["teams"]]
+                self.roster_source = session.save
             semantic = getattr(job, "history", None) is not None
             roster = getattr(job, "teams_total", None) is not None
             zero = getattr(job, "rounds_total", None) is not None
@@ -2795,8 +2797,7 @@ class App(ttk.Frame):
                     self.status_var.set(
                         f"完成：写回 {int(getattr(job, 'written', 0))} 项，结果轴已生成"
                     )
-                # 阵容结果轴里只有一支队伍，不当下一次搜索的输入（候选池在界面上，不用从轴上读）
-                if not roster and not zero:
+                if not zero and (not roster or session.save.is_labyrinth):
                     workbook = getattr(session, "workbook", None) if session else None
                     if workbook is not None and Path(workbook).is_file():
                         self._load_result_axis(Path(workbook))

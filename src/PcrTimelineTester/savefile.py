@@ -39,6 +39,15 @@ UNIT_FIELDS = (
     "enemyid", "unitId", "level", "rarity", "love", "rank", "equipLevel", "skillLevel",
     "playLoveDic", "uniqueEqLv", "uniqueEq2Lv", "exEquip", "exEquipLevel", "exEquipSubs",
     "PrefabId", "love2", "connectRank", "connectRankLimit",
+    "uniqueEqPlus", "uniqueEq2Plus", "exEquipExceedRank",
+)
+
+# PCRCalculator 的 RemoteSimulator.CreateRequest 从当前存档组带入的特殊战斗参数。
+EVENT_FIELDS = (
+    "LabyrinthQuestId", "LabyrinthDifficulty", "LabyrinthEnhancedNodeIds",
+    "LabyrinthRelicIds", "InvasionRelicIds", "LabyrinthAlphaRupee",
+    "LabyrinthOwnedUnitsCount", "LabyrinthOwnedUnitRoleCounts",
+    "LabyrinthOwnedUnitTalentCounts", "LabyrinthOwnedUnitIds",
 )
 
 FrameAxis = list[list[float]]
@@ -289,6 +298,10 @@ class SaveFile:
         return self.boss_name or "Boss"
 
     @property
+    def is_labyrinth(self) -> bool:
+        return bool(self.enemy_ids and self.enemy_ids[0] // 10_000_000 == 77)
+
+    @property
     def unit_count(self) -> int:
         return len(self.players)
 
@@ -317,7 +330,7 @@ class SaveFile:
                 group.get(key, 0)
                 for key in ("talentQuestMap", "talentQuestArea", "talentQuestIndex")
             )
-        return {
+        context = {
             "PlayerList": deepcopy(self.players),
             "EnemyList": [],
             "GuildEnemyList": list(self.enemy_ids),
@@ -335,6 +348,11 @@ class SaveFile:
             "SetToggles": [],
             "NeedOnceResult": False,
         }
+        for field_name in EVENT_FIELDS:
+            saved_name = field_name[0].lower() + field_name[1:]
+            if group.get(saved_name) is not None:
+                context[field_name] = deepcopy(group[saved_name])
+        return context
 
 
 def parse_save(

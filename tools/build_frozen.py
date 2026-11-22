@@ -86,6 +86,7 @@ def build(*, clean: bool, name: str, console: bool = False) -> int:
         "--name", name,
         "--paths", str(ROOT / "src"),
         "--collect-submodules", "PcrTimelineTester",
+        "--add-data", f"{ROOT / 'pyproject.toml'}{os.pathsep}PcrTimelineTester",
         "--distpath", str(DIST),
         "--workpath", str(BUILD / "pyinstaller"),
         "--specpath", str(BUILD),

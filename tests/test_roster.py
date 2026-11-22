@@ -185,6 +185,46 @@ def test_combo_and_toggle_text():
     assert toggle_text((True, False)) == "SET（O）、AUTO（X）"
 
 
+def test_labyrinth_uses_each_units_gear_in_search_and_result(tmp_path, monkeypatch):
+    save = _save(tmp_path)
+    save.enemy_ids = [770000001]
+    original = save.unit_ids[0]
+    save.players[0]["level"] = 67
+    newcomer = 1009
+    team = (*save.unit_ids[:4], newcomer)
+    flags = (True, False, False, True, True)
+    probes = []
+
+    def fetch(requests):
+        body, = requests
+        players = body["PlayerList"]
+        if body["ToMaxUnitAttr"]:
+            probes.append(body)
+            players = [{"unitId": p["unitId"], "level": 412,
+                        "exEquip": [4110501, 4203501, 4305511] if p["unitId"] == newcomer
+                        else [4101501, 4201501, 4302511]} for p in reversed(players)]
+        return [{"Success": True, "CurrentSeed": body["Settings"]["RandomSeed"],
+                 "PlayerList": players, "Stats": {"TotalDamage": 777, "UBTime": [[310]] * 5}}]
+
+    for full in (False, True):
+        probes.clear()
+        with TeamEvaluator(save, _settings(to_max_attr=full)) as evaluator:
+            monkeypatch.setattr(evaluator, "_fetch", fetch)
+            body = evaluator.request_for(team, toggles=flags)
+            assert not body["ToMaxUnitAttr"]
+            players = {p["unitId"]: p for p in body["PlayerList"]}
+            assert players[original]["level"] == (412 if full else 67)
+            assert players[original]["exEquip"] == [4101511, 4201503, 4302514]
+            assert players[newcomer]["exEquip"] == [4110511, 4203501, 4305514]
+            assert players[newcomer]["exEquipExceedRank"] == [0, 0, 5]
+            assert players[newcomer]["exEquipSubs"] == {"0": [5, 4]*4, "1": [5, 4]*4, "2": [2, 4]*4}
+            assert players[original]["exEquipSubs"]["2"] == [1, 4]*4
+            tuned = evaluator.labyrinth_result_save(team, flags)
+            assert tuned.group["playerData"]["playrCharacters"] == body["PlayerList"]
+            assert tuned.frames == [[310]] * 5
+            assert len(probes) == 1
+
+
 # ---------------------------------------------------------------- 任务
 def _job(tmp_path, **overrides):
     save = _save(tmp_path)

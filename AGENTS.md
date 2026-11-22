@@ -36,4 +36,4 @@ python tools/build_frozen.py
 
 - 本地可用离线跑测器，CI 用 `python -m pytest -q`。真机验证用独立端口，保留用户的 8080 算器。用一条实际轴跑 `inspect` 和小规模搜索，核对报告、结果表及自动载入。
 - 构建机使用 PyInstaller 和 Pillow。诊断冻结版时可加 `--console`。提交使用中文，排除 `build/`、`dist/`、`runs/` 和临时脚本。
-- 发布时同步 `pyproject.toml` 和 `__init__.py` 版本号。`vX.Y.Z` 标签触发测试、打包和发布。保留 README 的许可说明，发布图标包时注明「游戏素材版权归 Cygames，仅供个人研究使用」。
+- 发布版本号只需修改 `pyproject.toml` 的 `[project].version`。`vX.Y.Z` 标签触发测试、打包和发布。保留 README 的许可说明，发布图标包时注明「游戏素材版权归 Cygames，仅供个人研究使用」。

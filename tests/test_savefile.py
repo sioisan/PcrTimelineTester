@@ -81,6 +81,31 @@ def test_request_preserves_saved_connect_ranks(tmp_path, five_rows) -> None:
     assert "connectRank" not in players[2] and "connectRankLimit" not in players[2]
 
 
+def test_labyrinth_context_survives_export(tmp_path, five_rows) -> None:
+    raw = timeline_raw(five_rows)
+    group = raw["playerGroupData"]
+    group.update(selectedEnemyIDs=[770423002, 770423001], waveGroupId=770423001,
+                 labyrinthQuestId=770423010, labyrinthDifficulty=10, labyrinthRelicIds=[21001, 21004],
+                 labyrinthEnhancedNodeIds=[1, 2], labyrinthOwnedUnitRoleCounts={"3": 2},
+                 labyrinthAlphaRupee=0)
+    group["playerData"]["playrCharacters"][0].update(exEquipExceedRank=[0, 5, 5], uniqueEq2Plus=False)
+    save = read_save(write_save(tmp_path / "黎明界.xlsx", raw))
+    path = tmp_path / "调帧结果.xlsx"
+    write_tuned_save(path, save, five_rows, battle_seed=666, damage=1, summary=[["复核"]])
+    for axis in (save, read_save(path)):
+        context = axis.request_context(battle_time=90, battle_seed=666)
+        assert context["LabyrinthQuestId"] == 770423010
+        assert context["LabyrinthDifficulty"] == 10
+        assert context["WaveGroupId"] == 770423001
+        assert context["GuildEnemyList"] == [770423002, 770423001]
+        assert context["LabyrinthRelicIds"] == [21001, 21004]
+        assert context["LabyrinthEnhancedNodeIds"] == [1, 2]
+        assert context["LabyrinthOwnedUnitRoleCounts"] == {"3": 2}
+        assert context["LabyrinthAlphaRupee"] == 0
+        assert context["PlayerList"][0]["exEquipExceedRank"] == [0, 5, 5]
+        assert context["PlayerList"][0]["uniqueEq2Plus"] is False
+
+
 def test_write_tuned_save_is_a_new_importable_workbook(tmp_path, five_rows) -> None:
     save = make_save(tmp_path, five_rows)
     tuned = [[480.0, 1000.0], [500.0, 1100.0], [600.0, 1200.0], [700.0, 1300.0], [800.0, 1400.0]]

@@ -529,7 +529,7 @@ class RosterSession:
 
     def run(self) -> int:
         from .report import write_roster_report
-        from .roster import save_with_team
+        from .roster import LABYRINTH_EX, save_with_team
 
         started = time.perf_counter()
         summary = self.job.run()
@@ -545,13 +545,18 @@ class RosterSession:
             return CANCELLED
         export = summary.get("export") or {}
         team = tuple(int(unit) for unit in (export.get("team") or self.job.best_team or ()))
-        tuned = save_with_team(self.save, team) if team else self.save
+        rows = roster_workbook_summary(summary, names=self.names)
+        if team and self.save.is_labyrinth:
+            tuned = self.job.evaluator.labyrinth_result_save(team, export["toggles"])
+            rows.append(["黎明界 EX", LABYRINTH_EX, "帧轴记录首个种子下最优组合实际释放的 UB。"])
+        else:
+            tuned = save_with_team(self.save, team) if team else self.save
         workbook = self.run_dir / self.workbook_name
         write_tuned_save(
-            workbook, tuned, self.save.frames,
+            workbook, tuned, tuned.frames,
             battle_seed=self.settings.seed,
             damage=int(summary.get("final") or 0),
-            summary=roster_workbook_summary(summary, names=self.names),
+            summary=rows,
             sheet_name="阵容结果",
         )
         summary["result_workbook"] = str(workbook)
