@@ -38,7 +38,7 @@ CELL_LIMIT = 32767
 UNIT_FIELDS = (
     "enemyid", "unitId", "level", "rarity", "love", "rank", "equipLevel", "skillLevel",
     "playLoveDic", "uniqueEqLv", "uniqueEq2Lv", "exEquip", "exEquipLevel", "exEquipSubs",
-    "PrefabId", "love2",
+    "PrefabId", "love2", "connectRank", "connectRankLimit",
 )
 
 FrameAxis = list[list[float]]

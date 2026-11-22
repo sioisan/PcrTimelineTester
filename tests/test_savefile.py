@@ -70,6 +70,17 @@ def test_request_context(tmp_path, five_rows) -> None:
     assert context["PlayerList"][0]["unitId"] == 1001
 
 
+def test_request_preserves_saved_connect_ranks(tmp_path, five_rows) -> None:
+    raw = timeline_raw(five_rows)
+    units = raw["playerGroupData"]["playerData"]["playrCharacters"]
+    units[0].update(connectRank=12, connectRankLimit=15)
+    units[1].update(connectRank=0, connectRankLimit=5)
+    save = read_save(write_save(tmp_path / "rank.xlsx", raw))
+    players = save.request_context(battle_time=90, battle_seed=666)["PlayerList"]
+    assert [(p["connectRank"], p["connectRankLimit"]) for p in players[:2]] == [(12, 15), (0, 5)]
+    assert "connectRank" not in players[2] and "connectRankLimit" not in players[2]
+
+
 def test_write_tuned_save_is_a_new_importable_workbook(tmp_path, five_rows) -> None:
     save = make_save(tmp_path, five_rows)
     tuned = [[480.0, 1000.0], [500.0, 1100.0], [600.0, 1200.0], [700.0, 1300.0], [800.0, 1400.0]]
