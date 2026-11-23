@@ -20,6 +20,8 @@
 
 from __future__ import annotations
 
+from .recovery import verifying
+
 import math
 import random
 import time
@@ -300,6 +302,7 @@ class ZeroScore:
     lanes: tuple[tuple[float, ...], ...] = ()
 
     input_windows: tuple[tuple[int, ...], ...] = ()
+    steps: tuple[str, ...] = ()
 
     @property
     def is_win(self) -> bool:
@@ -314,6 +317,7 @@ class ZeroScore:
             "opportunities": [list(row) for row in self.opportunities],
             "lanes": [list(row) for row in self.lanes],
             "input_windows": [list(row) for row in self.input_windows],
+            "steps": list(self.steps),
         }
 
     @classmethod
@@ -328,6 +332,7 @@ class ZeroScore:
             plan=plan,
             opportunities=opps,
             input_windows=tuple(tuple(row) for row in data.get("input_windows") or ()),
+            steps=tuple(data.get("steps") or ()),
             lanes=lanes,
         )
 
@@ -503,6 +508,10 @@ class ZeroEvaluator:
             )
         return scores
 
+    def anchor_search(self):
+        from .zero_anchor import AnchorSearch
+        return AnchorSearch(self, self.save)
+
     def evaluate_one(self, plan: Plan, opportunities: Sequence[Sequence[int]]) -> ZeroScore:
         return self.evaluate([plan], opportunities)[0]
 
@@ -544,6 +553,7 @@ class ZeroJob:
         self.opportunities: tuple[tuple[int, ...], ...] = tuple(() for _ in range(TEAM_SIZE))
         self.best: ZeroScore | None = None
         self.current: ZeroScore | None = None
+        self.anchor_best: ZeroScore | None = None
         self.history: list[dict] = []
         self.model_rng = random.Random(int(settings.seed) * 7919 + 17)
         self.cancelled = False
@@ -579,6 +589,8 @@ class ZeroJob:
         self.log("站位：" + self._station_text())
         started = time.perf_counter()
         limit = int(settings.ub_limit)
+        from .zero_anchor import cast_order
+        anchor_search = self.evaluator.anchor_search()
         prior_battles = self.battles_done - self.evaluator.battles
         if self.cancelled_requested:
             self.cancelled = True
@@ -600,6 +612,17 @@ class ZeroJob:
             starts = self.evaluator.evaluate(list(dict.fromkeys(openings)), self.opportunities)
             first = max(starts, key=lambda score: score.damage)
             self.opportunities = first.opportunities or self.opportunities
+            if anchor_search:
+                starts_at = [self.baseline["set_frames"], self.baseline["auto_frames"]]
+                if self.save.has_frames:
+                    by_unit = dict(zip(self.save.unit_ids, self.save.frames[:TEAM_SIZE]))
+                    starts_at.insert(0, [by_unit.get(unit, ()) for unit in self.units])
+                self.anchor_best = anchor_search.evaluate([cast_order([row[:limit] for row in rows])
+                                                          for rows in starts_at])
+                if self.anchor_best:
+                    self.log(f"已逐刀确认 UB 锚点起点，期望伤害 {self.anchor_best.damage:,.0f}。")
+                    if self.anchor_best.damage >= first.damage:
+                        first = self.anchor_best
             self.best = first
             self.current = max(starts[:2], key=lambda score: score.damage)
             self.rounds_done = 1
@@ -607,13 +630,19 @@ class ZeroJob:
             self._push_history(1, first, first)
         self.battles_done = prior_battles + self.evaluator.battles
 
+        if anchor_search and self.anchor_best is None and self.rounds_done > 1:
+            # 旧检查点没有锚点分支，先验证仍可复用的原轴。
+            if self.save.has_frames and tuple(self.save.unit_ids) == self.units:
+                self.anchor_best = anchor_search.evaluate([cast_order([row[:limit] for row in self.save.frames[:5]])])
+                if self.anchor_best and self.anchor_best.damage > self.best.damage:
+                    self.best = self.anchor_best
         schedule = temperatures(settings, max(1, int(settings.iterations)))
         for round_index in range(self.rounds_done, int(settings.iterations) + 1):
             if self.cancelled_requested:
                 self.cancelled = True
                 self.log("已停止：退火到第 {} 轮".format(self.rounds_done))
                 break
-            anchor = self.best if round_index % 2 == 0 else self.current
+            anchor = self.best if round_index % 2 == 0 and not self.best.steps else self.current
             windows = anchor.opportunities or self.opportunities
             if anchor.input_windows and round_index % 4 in (1, 2):
                 windows = anchor.input_windows
@@ -639,6 +668,14 @@ class ZeroJob:
             if accept:
                 self.current = pick
                 self.opportunities = pick.opportunities or self.opportunities
+            if anchor_search and self.anchor_best and round_index % 2:
+                variants = anchor_search.neighbors(self.anchor_best, self.model_rng, limit, settings.batch)
+                candidate = anchor_search.evaluate(variants, self.anchor_best.damage)
+                if candidate and candidate.damage >= self.anchor_best.damage:
+                    self.anchor_best = candidate
+                    if candidate.damage > pick.damage:
+                        pick = candidate
+                self.battles_done = prior_battles + self.evaluator.battles
             improved = self.best is None or (pick.damage, pick.frames) > (self.best.damage, self.best.frames)
             if improved:
                 self.best = pick
@@ -653,10 +690,17 @@ class ZeroJob:
 
         self.cancelled = self.cancelled_requested
         if self.best is not None and settings.verify and not self.cancelled:
-            if self.best.lanes:
-                again = self.evaluator.evaluate_lanes([self.best.lanes])[0]
-            else:
-                again = self.evaluator.evaluate_one(self.best.plan, self.best.opportunities or self.opportunities)
+            lanes = self.best.lanes or build_lanes(self.best.plan, self.best.opportunities or self.opportunities)
+            notes = self.best.steps or plan_rows(self.best.plan)
+            with verifying(lanes, self.best.damage, auto_mode=not self.best.steps, notes=[["操作", s] for s in notes]):
+                if self.best.steps:
+                    again = anchor_search.evaluate([cast_order(lanes)])
+                    if again is None or again.steps != self.best.steps or again.damage != self.best.damage:
+                        raise ValueError("UB 锚点复核的操作或整场伤害与候选不一致")
+                elif self.best.lanes:
+                    again = self.evaluator.evaluate_lanes([self.best.lanes])[0]
+                else:
+                    again = self.evaluator.evaluate_one(self.best.plan, self.best.opportunities or self.opportunities)
             self.battles_done = prior_battles + self.evaluator.battles
             if abs(again.damage - self.best.damage) < 0.5 and again.frames == self.best.frames:
                 self.log("复核通过：{:,}（同一次模拟）".format(int(again.damage)))
@@ -674,15 +718,18 @@ class ZeroJob:
         self.log("=== 最优：{:,}（{} 帧 / {}） ===".format(
             int(best.damage), int(best.frames), self._result_text(best.result)
         ))
-        for line in plan_rows(best.plan):
+        for line in (() if best.steps else plan_rows(best.plan)):
             index = int(line.split(":")[0]) - 1
             name = self.names.get(self.units[index], str(self.units[index])) if index < len(self.units) else ""
             self.log("    {} {}".format(name, line))
+        for step in best.steps:
+            self.log("    " + step)
         self.cancelled = self.cancelled_requested
         if not self.cancelled:
             self.export = {
                 "plan": [list(row) for row in best.plan],
                 "damage": int(best.damage),
+                "steps": list(best.steps),
                 "frames": int(best.frames),
                 "result": int(best.result),
                 "lanes": [list(lane) for lane in (best.lanes or build_lanes(best.plan, best.opportunities or self.opportunities))],
@@ -696,7 +743,7 @@ class ZeroJob:
         mark = "  新的最优" if improved else ""
         self.log("[{}/{}] {} → {:,}（{} 帧 / {}）{}".format(
             min(self.rounds_done, self.rounds_total), self.rounds_total,
-            plan_text(score.plan), int(score.damage), int(score.frames),
+            ("按 UB 锚点操作" if score.steps else plan_text(score.plan)), int(score.damage), int(score.frames),
             self._result_text(score.result), mark,
         ))
 
@@ -707,7 +754,7 @@ class ZeroJob:
             "frames": int(score.frames),
             "result": int(score.result),
             "plan": [list(row) for row in score.plan],
-            "text": plan_text(score.plan),
+            "text": "；".join(score.steps) if score.steps else plan_text(score.plan),
             "best": int(best.damage),
         })
         if len(self.history) > 4000:
@@ -740,6 +787,7 @@ class ZeroJob:
             "battles": int(self.battles_done),
             "best": self.best.to_dict() if self.best else None,
             "current": self.current.to_dict() if self.current else None,
+            "anchor_best": self.anchor_best.to_dict() if self.anchor_best else None,
             "baseline": {
                 "set_damage": float(self.baseline.get("set_damage") or 0.0),
                 "auto_damage": float(self.baseline.get("auto_damage") or 0.0),
@@ -762,6 +810,8 @@ class ZeroJob:
         self.battles_done = int(state.get("battles") or 0)
         if state.get("best"):
             self.best = ZeroScore.from_dict(state["best"])
+        if state.get("anchor_best"):
+            self.anchor_best = ZeroScore.from_dict(state["anchor_best"])
         if state.get("current"):
             self.current = ZeroScore.from_dict(state["current"])
         baseline = state.get("baseline") or {}
@@ -810,6 +860,7 @@ class ZeroJob:
                 "plan": [list(row) for row in (best.plan if best else ())],
                 "text": plan_text(best.plan) if best else "",
                 "rows": plan_rows(best.plan) if best else [],
+                "steps": list(best.steps) if best else [],
                 "damage": int(best.damage) if best else 0,
                 "frames": int(best.frames) if best else 0,
                 "result": int(best.result) if best else 0,

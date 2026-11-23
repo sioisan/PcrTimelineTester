@@ -9,7 +9,7 @@ import sys
 import time
 
 from .ga.semantics import SemanSequenceType, SemanSkillType, SemanUBType
-from .roster import lineup_names, lineup_text
+from .roster import accessory_text, lineup_names, lineup_text
 
 CONFIG = "config.json"
 STATE = "state.json"
@@ -437,7 +437,7 @@ def write_roster_report(path: Path, summary: dict, *, names: dict[int, str] | No
     lines.append("")
     lines.append("## 最优阵容")
     lines.append("")
-    lines.append("| 队伍 | 角色 | 每位角色的操作 |")
+    lines.append("| 队伍 | 角色 | 操作 |")
     lines.append("| --- | --- | --- |")
     team = export.get("team") or []
     toggles = export.get("toggles") or []
@@ -452,21 +452,22 @@ def write_roster_report(path: Path, summary: dict, *, names: dict[int, str] | No
     if teams:
         lines.append(f"## 前 {len(teams)} 支队伍")
         lines.append("")
-        lines.append("| # | 队伍 | 每位角色的操作 | 伤害 |")
-        lines.append("| --- | --- | --- | --- |")
+        lines.append("| # | 队伍 | 操作 | 伤害 | EX 饰品 |")
+        lines.append("| --- | --- | --- | --- | --- |")
         for rank, item in enumerate(teams, start=1):
             members = item.get("team") or []
             flags = item.get("toggles") or []
             text = lineup_names(members, names)
             operation = lineup_text(members, flags, names)
             lines.append(
-                f"| {rank} | {_cell(text)} | {_cell(operation)} | {_int_text(item.get('damage'))} |"
+                f"| {rank} | {_cell(text)} | {_cell(operation)} | {_int_text(item.get('damage'))} | "
+                f"{_cell(accessory_text(members, item.get('accessories'), names))} |"
             )
         lines.append("")
     lines.append("- 每支候选队伍都把「每个人 AUTO / SET」的组合各打一遍（5 人 = 32 种），"
                  "取伤害最高的那种作为这支队的分；上表记下最终采用的操作。")
     lines.append("- 请求里不带导入轴的帧：`O` = SET（一有机会就按），`X` = AUTO（角色自己找时机，靠 `IsAutoMode`）。")
-    lines.append("- 角色按游戏里的站位（攻击范围从小到大）排列并标了号码，队伍里的先后只是枚举顺序。")
+    lines.append("- 角色按游戏里的站位（攻击范围从小到大）排列，队伍里的先后只是枚举顺序。")
     lines.append("- 分组里设了最少人数的，每支队伍先抽够这个人数，剩下的名额从未分组的角色里补；"
                  "没设最少人数的分组等于没分组，成员回落到未分组一起抽。")
     lines.append("- 所有组合都会排到（`队伍数 = 各组 C(成员, 最少) 连乘 × C(未分组, 剩余名额)`），不做随机采样。")
@@ -511,18 +512,20 @@ def write_zero_report(path: Path, summary: dict, *, names: dict[int, str] | None
     lines.append(f"- 最优期望伤害：{_int_text(best.get('damage'))}")
     lines.append(f"- 战斗帧 / 结果：{_int_text(best.get('frames'))} 帧 / {_result_label(best.get('result'))}")
     if summary.get("result_workbook"):
-        lines.append(f"- 结果表：`{summary.get('result_workbook')}`（轴保持原样，另加一页「0押结果」）")
+        lines.append(f"- 结果表：`{summary.get('result_workbook')}`（锚点方案在「0押结果」中逐刀列出）")
     lines.append("")
     lines.append("## 最优方案的逐刀设定")
     lines.append("")
     lines.append("| 站位 | 角色 | 逐刀设定（O=SET、X=AUTO） |")
     lines.append("| --- | --- | --- |")
-    for index, unit in enumerate(units):
+    for index, unit in enumerate(units if not best.get("steps") else ()):
         flags = plan[index] if index < len(plan) else []
         body = "".join("O" if flag else "X" for flag in flags) or "O"
         tail = "O" if (flags[-1] if flags else True) else "X"
         lines.append(f"| {index + 1} | {_cell(names.get(unit, str(unit)))} | `{body}`（之后一律 {tail}） |")
     lines.append("")
+    if best.get("steps"):
+        lines.extend(["## 按时间执行的 UB 操作", "", *("- " + step for step in best["steps"]), ""])
     history = list(summary.get("history") or ())
     if history:
         lines.append("## 刷新记录")
@@ -536,11 +539,11 @@ def write_zero_report(path: Path, summary: dict, *, names: dict[int, str] | None
         lines.append("")
     lines.append("## 说明")
     lines.append("")
-    lines.append("- 0 押 = 不打手动 UB，只决定「TP 满的那一刻按不按」：`O` = 到点就按（SET），`X` = 不按，交给自动（会等角色空下来）。")
+    lines.append("- 0 押可在自身 TP 满或队友 UB 时切换操作：`O` = 到点就按（SET），`X` = 不按，交给自动（会等角色空下来）。")
     lines.append("- 判据取自接口：`Stats.TpChangeEvents` 里 `CrossedReady` 的那一帧就是 TP 刚满的帧（`CalcStats` 带 256 才有）。某个角色第 k 刀选 `O`，就把第 k 个 TP 满帧写进 `UBExecTimeList`。")
     lines.append("- 同一角色逐刀可以不一样：`O X O O …` 表示第一次 TP 满时按、第二次不按、第三次起都按；表里省略的刀一律沿用最后一刀。")
     lines.append("- 刀数不写死：跳过一刀会让后面 TP 满的时机整体变化，所以每轮都用最近一次回包重新算 TP 满帧，能按出 14 刀时也会排到 14 刀（上限「最多几刀」）。")
-    lines.append("- 请求里不带导入轴原本的帧，`SetToggles` 全关、`IsAutoMode` 开（没写进帧表的刀由自动兜底）。")
+    lines.append("- 逐刀 O/X 分支中，`SetToggles` 全关、`IsAutoMode` 开（没写进帧表的刀由自动兜底）。")
     lines.append("- 中断不会导出结果表，`state.json` 记着当前最优方案，`resume` 接着跑。")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 

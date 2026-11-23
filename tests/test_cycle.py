@@ -97,7 +97,11 @@ def test_mismatched_replay_never_publishes_result(tmp_path):
     run = CycleSession(save,CycleSettings(depth=1),tmp_path/"run",client=client,log=mismatch)
     with pytest.raises(TuneError,match="复核"):
         run.run()
-    assert not list(run.run_dir.glob("*.xlsx"))
+    assert not (run.run_dir / "循环搜索结果.xlsx").exists()
+    candidate = modes.get("cycle").read_save(run.run_dir / "复核失败-最后候选.xlsx")
+    assert tuple(map(tuple, candidate.frames)) == run.job.best.axis
+    assert json.loads((run.run_dir / "state.json").read_text("utf8"))["best"]
+    assert run.summary["status"] == "verification_failed"
 
 
 
@@ -134,3 +138,50 @@ def test_removing_a_ub_can_be_the_best_score(tmp_path):
     assert session.run() == 0
     assert session.summary["ub_after"] == (0, 1, 0, 0, 0)
     assert session.summary["final"] == 180
+
+
+def test_polish_can_gain_when_two_independent_one_frame_edits_are_flat(tmp_path):
+    class Linked(Battles):
+        def evaluate(self, axes):
+            results = super().evaluate(axes)
+            return [replace(r, metric=120, damage=120) if tuple(a[0]) == (299,) and tuple(a[1]) == (399,)
+                    else replace(r, metric=100, damage=100) for a, r in zip(axes, results)]
+
+    save = make_save(tmp_path, BASE)
+    settings = CycleSettings(depth=1, width=1, polish_stalls=2, candidates=64)
+    session = CycleSession(save, settings, tmp_path/"联动", client=Linked(save.unit_ids), log=lambda _: None)
+    assert session.run() == 0
+    assert session.summary["final"] == 120
+    assert session.job.history[0]["damage"] == 120
+    assert [r["gain"] for r in session.summary["polish_history"]] == [0, 0]
+
+
+def test_polish_generates_three_way_permutations_with_boss_row_preserved():
+    from PcrTimelineTester.cycle import polish_moves
+    axis = ((500,), (500.001,), (500.002,), (), (), (900,))
+    trace = Trace({"UBTime": axis[:5], "TpChangeEvents": []}, list(range(5)))
+    found = polish_moves(axis, trace, 5399, 64, 0)
+    assert ((500.002,), (500,), (500.001,), (), (), (900,)) in found
+
+
+def test_burst_requires_matching_target_and_damage_type():
+    from PcrTimelineTester.cycle import burst_moves
+    units = list(range(1, 6))
+    axis = ((201,), (310,), (), (), (), (500,))
+    buff = dict(IsBuff=False, BuffParamKindName="MAGIC_DEF", SourceUnitId=1,
+                TargetUnitId=100, StartFrame=205, EndFrame=309, Value=-42)
+    hit = dict(Frame=311, SourceUnitId=2, TargetUnitId=100, Damage=42, DamageTypeName="MGC")
+    stats = dict(UBTime=axis[:5], TpChangeEvents=[], BuffDebuffEvents=[buff], HitTraceEvents=[hit])
+    assert len(burst_moves(axis, Trace(stats, units))) == 3
+    for change in (dict(TargetUnitId=101), dict(DamageTypeName="ATK")):
+        assert not burst_moves(axis, Trace(dict(stats, HitTraceEvents=[dict(hit, **change)]), units))
+
+
+def test_combinations_preserve_disjoint_edits_and_boss_lane():
+    from PcrTimelineTester.cycle import Branch, combined_axes
+    parent = Branch(((300, 400), (), (), (), (), (800,)), 100, (), ("原轴",))
+    a = replace(parent, axis=((299, 400), *parent.axis[1:]), path=("提前第一刀",))
+    b = replace(parent, axis=((300, 401), *parent.axis[1:]), path=("推迟第二刀",))
+    c = replace(parent, axis=((298, 400), *parent.axis[1:]), path=("同刀冲突",))
+    assert list(combined_axes(parent, [a, b], 1))[0][0] == ((299, 401), *parent.axis[1:])
+    assert not list(combined_axes(parent, [a, c], 1))

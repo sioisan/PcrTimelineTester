@@ -6,7 +6,7 @@
 
 - 战斗模拟只通过 PCRCalculator 的 HTTP `POST /simulate`。禁止读写游戏内存、添加 hook 或读写 `TimingThreshold`。
 - 请求开启 `NeedOnceResult`。优先取 `OnceResult.exceptDamage`，缺失时取 `Stats.TotalDamage`。多种子平均是近似期望。
-- 搜索期间保留内存中的候选和可续跑的 `state.json`。正常结束才导出结果表，停止、Ctrl+C 或关窗须允许续跑并避免写回半成品。GUI 完成后自动载入结果表。
+- 搜索期间保留内存中的候选和可续跑的 `state.json`。正常完成导出结果表；最终复核报错时保存「复核失败-最后候选.xlsx」、原因和续跑状态。主动停止、Ctrl+C 或关窗仍按中断逻辑处理。GUI 完成后自动载入结果表。
 - `server.py` 复用已监听的算器，自己启动时使用 `CREATE_NEW_CONSOLE` 显示前台窗口。仅以 PID 和 Windows Job 对象管理自己的进程，禁止按名称结束算器。
 
 ## 搜索约束
@@ -16,8 +16,8 @@
 | 逐帧 · `job.py`、`search.py`、`effects.py` | `build_targets()` 按（帧号、角色行、刀序）排序，帧范围 90～5399。本项最优低于上一项最优时不采纳，同伤同帧跳过，第 2 轮起无提升就保留原帧。向下遇到实放帧与请求不符时最多再探 `min(UB_MISS_LIMIT, outer_probes)` 次，此限制仅用于向下搜索。效果帧联调仅采纳整场伤害提升的组合。 |
 | 循环 · `cycle.py` | 以实际事件生成增删刀、充能联动和换段候选，按层保留分支与续跑状态。主结果按整场期望伤害选，多发分支另记。发布工作簿前，读回导出的帧轴复核伤害及首种子五人的实放 UB 次数。 |
 | 语义 GA / 退火 · `ga/`、`anneal.py` | 语义车道固定五行，多余行截断，少于五行时忽略语义轴及消费顺序，两种情况均写中文日志。GA 先核对自带语义能否还原帧轴，对不上就从帧轴重新推起点。变异和交叉须保持消费顺序与各车道刀数相容。 |
-| 阵容 · `roster.py` | 枚举全部合法五人队并去重，分组只设下限且可重叠。请求用空 `UBExecTimeList`，AUTO 开启 `IsAutoMode`，SET 使用 `SetToggles`。请求中的队伍、开关及显示都按 `lineup_order` 排序（站位宽度、unitId 升序）。保留 4 路并发，按完成队数显示进度，保留前 100 队。全 SET 筛选只测一种，详情页的「试这队 32 种组合」始终测满。 |
-| 0押 · `zero.py` | 用 `CalcStats=1\|2\|256` 读取 `CrossedReady` 和 `UBTime`。第 k 刀选 O 就写第 k 个 TP 满帧，选 X 就交给 AUTO。开启 `IsAutoMode`，所有 `SetToggles` 为假。刀数随回包变化，复核原样重发 `ZeroScore.lanes`，结果表只给原轴添加摘要。 |
+| 阵容 · `roster.py` | 枚举全部合法五人队并去重，分组只设下限且可重叠。先分队预载候选池。正式请求用空 `UBExecTimeList`，AUTO 开启 `IsAutoMode`，SET 使用 `SetToggles`。请求中的队伍、开关及显示都按 `lineup_order` 排序（站位宽度、unitId 升序）。保留 4 路并发，按完成队数显示进度，保留前 100 队。全 SET 筛选只测一种，详情页的「试这队 32 种组合」始终测满。 |
+| 0押 · `zero.py` | 用 `CalcStats=1\|2\|256` 读取 `CrossedReady` 和 `UBTime`。第 k 刀选 O 就写第 k 个 TP 满帧，选 X 就交给 AUTO。开启 `IsAutoMode`，所有 `SetToggles` 为假。刀数随回包变化，逐刀 O/X 的复核原样重发 `ZeroScore.lanes`。队友 UB 锚点分支关闭全局 AUTO，按前缀回放校验 TP、同帧顺序和自然收招，再复核整场。锚点方案胜出时在结果表写入实测帧和操作清单。 |
 
 ## 界面与角色资料
 

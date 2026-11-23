@@ -7,6 +7,8 @@
 
 from __future__ import annotations
 
+from ..recovery import verifying
+
 from dataclasses import dataclass, field, replace
 import threading
 import time
@@ -393,7 +395,9 @@ class GaJob:
         best_lanes = tuple(
             fixed + lane for fixed, lane in zip(prepared.prefix, state.best.genome, strict=True)
         )
-        replay, frames = self.evaluator.replay(best_lanes, prepared.roles)
+        with verifying([], best.mean_damage,
+                       semantic=best_lanes, sequence=prepared.roles):
+            replay, frames = self.evaluator.replay(best_lanes, prepared.roles)
         self.log(f"导出前 replay：期望伤害 {replay.mean_damage:,} × 战斗帧 {replay.frames}")
         sequence = prepared.roles
         self.export = {

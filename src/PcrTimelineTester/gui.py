@@ -492,6 +492,7 @@ class App(ttk.Frame):
         self.events: queue.Queue = queue.Queue()
         self.roster_results: list[dict] = []
         self.roster_source = None
+        self.roster_result_settings = None
         self.shown_team: tuple[int, ...] = ()
         self._probe_team: tuple | None = None
         self.targets: list = []
@@ -592,6 +593,9 @@ class App(ttk.Frame):
         self.zero_ub_limit_var = tk.StringVar(value="12")
         self.roster_pool_var = tk.StringVar(value="")
         self.to_max_attr_var = tk.BooleanVar(value=True)
+        from .roster import ACCESSORIES
+        self.accessory_vars = {kind: tk.BooleanVar(value=False) for kind in ACCESSORIES}
+        self.accessory_locks = {}
         self.every_combo_var = tk.BooleanVar(value=True)
         self.roster_book = None
         self.roster_groups: list = []
@@ -733,7 +737,7 @@ class App(ttk.Frame):
                          text="循环搜索会根据 TP 到账和技能命中，尝试增减 UB 或重排队友的出手顺序。"
                               "搜索层数决定能连续改几步，保留分支决定每层留下几种打法，每支候选决定每种打法试多少次。"
                               "\n\n结果表保留整场期望伤害最高的轴。找到比原轴多开 UB 的打法时，还会另存多发分支。")
-        note.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(12, 0))
+        note.grid(row=len(mode_registry.CYCLE_PARAMS), column=0, columnspan=4, sticky="ew", pady=(12, 0))
         self._build_shared(self.tab_shared)
         self._build_frame_tab(self.tab_frame)
         self._build_ga(self.tab_ga)
@@ -1087,7 +1091,7 @@ class App(ttk.Frame):
         row = 3
         full = ttk.Checkbutton(roster, text="按满属性算", variable=self.to_max_attr_var)
         full.grid(row=row, column=0, columnspan=2, sticky="w", pady=(4, 0))
-        self._hint(full, "勾选后按满级满 Rank 计算。黎明界在两种练度下都使用武器 20 贯通、防具 12 贯通、首饰 8% 攻击。")
+        self._hint(full, "勾选后按满级满 Rank 计算。非会战使用所选 EX 配装，会战使用会战 EX。")
         combos = ttk.Checkbutton(roster, text="每队试 32 种 AUTO/SET", variable=self.every_combo_var)
         combos.grid(row=row, column=2, columnspan=2, sticky="w", pady=(4, 0))
         self._hint(combos, "每支队伍都把「每个人 AUTO / SET」的 2^5 种组合各打一遍取最高；"
@@ -1096,6 +1100,20 @@ class App(ttk.Frame):
         verify = ttk.Checkbutton(roster, text="跑完复核", variable=self.verify_var)
         verify.grid(row=row, column=0, columnspan=2, sticky="w", pady=(2, 0))
         self._hint(verify, "导出前用最优阵容再打一场确认伤害。")
+        row += 1
+        gear_row = ttk.Frame(roster)
+        gear_row.grid(row=row, column=0, columnspan=4, sticky="w")
+        ttk.Label(gear_row, text="EX 饰品").pack(side="left")
+        self.accessory_controls = []
+        for kind, var in self.accessory_vars.items():
+            control = ttk.Checkbutton(gear_row, text=kind, variable=var)
+            control.pack(side="left", padx=3)
+            self._hint(control, "未勾选时全员使用攻击饰品。角色锁定优先于这里的选择。")
+            self.accessory_controls.append(control)
+        row += 1
+        locks = ttk.Button(roster, text="设置角色饰品", command=self.choose_accessories)
+        locks.grid(row=row, column=0, columnspan=4, sticky="w", pady=3)
+        self.accessory_controls.append(locks)
         row += 1
         icon_row = ttk.Frame(roster)
         icon_row.grid(row=row, column=0, columnspan=4, sticky="ew", pady=(8, 0))
@@ -1139,8 +1157,7 @@ class App(ttk.Frame):
         self._hint(limit, "每个角色最多排到第几刀；更后面的刀沿用最后一刀的设定。")
         note = ttk.Label(
             zero,
-            text="这一页只在「0押轴」模式生效：整场不打手动 UB，同一角色的每一刀都可以单独选 O（SET，一有机会就按）"
-                 "或 X（AUTO，交给角色自己找时机），比如 1 号位 O X O O（之后都是 O）。退火会一步步试，越试越好。",
+            text="在自身 TP 满或队友开 UB 时，尝试让满 TP 角色同帧 SET 或等技能自然结束后 AUTO。结果表列出锚点和操作顺序。",
             style="Muted.TLabel",
             wraplength=760,
             justify="left",
@@ -1390,6 +1407,7 @@ class App(ttk.Frame):
         presets[name] = {
             "pool": [int(unit) for unit in self._pool_ids()],
             "groups": [group.to_dict() for group in self.roster_groups],
+            **self._accessory_config(),
         }
         try:
             path = self._presets_path()
@@ -1417,6 +1435,7 @@ class App(ttk.Frame):
             GroupSpec.from_dict(item) for item in data.get("groups") or [] if isinstance(item, dict)
         ]
         self._refresh_groups()
+        self._load_accessories(data)
         self._append_log(f"已载入预设：{name}（{len(pool)} 个候选，{len(self.roster_groups)} 个分组）")
 
     def choose_characters(self) -> None:
@@ -1552,22 +1571,58 @@ class App(ttk.Frame):
             return
         window = tk.Toplevel(self.master)
         window.title("阵容结果（前 100 支）")
-        window.geometry("760x420")
+        window.geometry("900x570")
         self._center_window(window, parent=self.master)
-        columns = ("rank", "team", "operation", "damage")
-        tree = ttk.Treeview(window, columns=columns, show="headings", height=14)
+        def result_table(columns, height):
+            holder = ttk.Frame(window)
+            holder.pack(fill="both", expand=True, padx=8, pady=4)
+            holder.columnconfigure(0, weight=1)
+            holder.rowconfigure(0, weight=1)
+            table = ttk.Treeview(holder, columns=columns, show="headings", height=height)
+            table.grid(row=0, column=0, sticky="nsew")
+            vertical = ttk.Scrollbar(holder, command=table.yview)
+            horizontal = ttk.Scrollbar(holder, orient="horizontal", command=table.xview)
+            vertical.grid(row=0, column=1, sticky="ns")
+            horizontal.grid(row=1, column=0, sticky="ew")
+            lines = [ttk.Separator(table, orient="vertical") for _ in columns[:-1]]
+
+            def align():
+                if not table.winfo_exists():
+                    return
+                widths = [table.column(col, "width") for col in columns]
+                x = 1 - round(table.xview()[0] * sum(widths))
+                for line, width in zip(lines, widths):
+                    x += width
+                    if 0 < x < table.winfo_width():
+                        line.place(x=x, y=24, relheight=1, width=1)
+                    else:
+                        line.place_forget()
+
+            def scrolled(first, last):
+                horizontal.set(first, last)
+                align()
+
+            table.configure(yscrollcommand=vertical.set, xscrollcommand=scrolled)
+            table.bind("<Configure>", lambda event: table.after_idle(align))
+            self._enable_column_resize(table)
+            table.bind("<B1-Motion>", lambda event: table.after_idle(align), add="+")
+            return table
+
+        tree = result_table(("rank", "team", "operation", "damage", "gear"), 12)
         for key, text, width, anchor in (
             ("rank", "#", 46, "center"),
             ("team", "队伍", 320, "w"),
-            ("operation", "每位角色的操作（按站位）", 330, "w"),
+            ("operation", "操作", 330, "w"),
             ("damage", "伤害", 110, "e"),
+            ("gear", "EX 饰品", 330, "w"),
         ):
             tree.heading(key, text=text)
-            tree.column(key, width=width, anchor=anchor)
-        from .roster import lineup_names, lineup_text
+            tree.column(key, width=width, stretch=False, anchor=anchor)
+        from .roster import accessory_text, lineup_names, lineup_text
 
         names = self._roster_names()
-        for rank, item in enumerate(self.roster_results, start=1):
+        results = sorted(self.roster_results, key=lambda row: -int(row["damage"]))
+        for rank, item in enumerate(results, start=1):
             members = item.get("team") or []
             flags = item.get("toggles") or []
             text = lineup_names(members, names)
@@ -1575,19 +1630,20 @@ class App(ttk.Frame):
             tree.insert(
                 "",
                 "end",
-                values=(rank, text, operation, f"{int(item.get('damage') or 0):,}"),
+                values=(rank, text, operation, f"{int(item.get('damage') or 0):,}",
+                        accessory_text(members, item.get("accessories"), names)),
             )
-        tree.pack(fill="both", expand=True, padx=8, pady=8)
 
-        detail = ttk.Treeview(window, columns=("combo", "damage", "frames", "result"), show="headings", height=10)
+        detail = result_table(("combo", "damage", "frames", "result", "gear"), 7)
         for key, text, width in (
             ("combo", "组合", 140),
             ("damage", "伤害", 140),
             ("frames", "战斗帧", 100),
             ("result", "结果", 100),
+            ("gear", "EX 饰品", 330),
         ):
             detail.heading(key, text=text)
-            detail.column(key, width=width, anchor="w")
+            detail.column(key, width=width, stretch=False, anchor="w")
 
         def probe() -> None:
             selection = tree.selection()
@@ -1595,16 +1651,15 @@ class App(ttk.Frame):
                 self._notice("先在列表里选一支队伍。")
                 return
             index = tree.index(selection[0])
-            item = self.roster_results[index]
+            item = results[index]
             team = tuple(int(unit) for unit in (item.get("team") or []))
-            self._probe_team = team
             if self.session is not None:
                 self._notice("等这次跑完再看。")
                 return
             # Tk 变量只能在主线程读：worker 里碰界面变量会抛
             # RuntimeError: main thread is not in main loop（以前「点了一行日志就没反应」就是这个）
             try:
-                settings = self._roster_settings()
+                settings = self.roster_result_settings or self._roster_settings()
                 # 这个按钮就是「32 种都试」，不看「每队试 32 种」那个勾选
                 settings = dataclasses.replace(settings, every_combo=True)
                 save = self.roster_source or self.save
@@ -1615,8 +1670,11 @@ class App(ttk.Frame):
             except Exception as exc:  # noqa: BLE001 - report to the UI
                 self._report_error(f"试这队失败：\n{exc}")
                 return
-            self.status_var.set(f"正在试这队：{shown}（{2 ** len(team)} 种组合）")
-            self._append_log(f"试这队 {2 ** len(team)} 种组合：{shown}")
+            self._probe_team = team
+            from .roster import accessory_options
+            count = 32 * math.prod(map(len, accessory_options(settings, team, save.is_clan_battle)))
+            self.status_var.set(f"正在试这队：{shown}（{count} 种配装与操作组合）")
+            self._append_log(f"试这队 {count} 种配装与操作组合：{shown}")
 
             def work() -> None:
                 import time as _time
@@ -1642,7 +1700,6 @@ class App(ttk.Frame):
         bar.pack(fill="x")
         ttk.Button(bar, text="试这队 32 种组合", command=probe).pack(side="left")
         ttk.Button(bar, text="关窗", command=window.destroy).pack(side="right")
-        detail.pack(fill="both", expand=True, padx=8)
 
         def fill(rows) -> None:
             detail.delete(*detail.get_children())
@@ -1650,7 +1707,7 @@ class App(ttk.Frame):
             from .roster import lineup_combo
 
             probe_team = tuple(int(unit) for unit in (getattr(self, "_probe_team", None) or ()))
-            for flags, score in rows:
+            for flags, score in sorted(rows, key=lambda row: -row[1].damage):
                 detail.insert(
                     "",
                     "end",
@@ -1659,6 +1716,7 @@ class App(ttk.Frame):
                         f"{int(score.damage):,}",
                         int(score.frames),
                         result_name(int(score.result)),
+                        accessory_text(probe_team, score.accessories, names),
                     ),
                 )
             window.lift()
@@ -1671,7 +1729,7 @@ class App(ttk.Frame):
         book = self.roster_book
         pool = []
         try:
-            pool = [int(unit) for unit in self._pool_ids()]
+            pool = self._accessory_pool()
         except Exception:  # noqa: BLE001 - 界面还没准备好
             pool = []
         for unit in pool:
@@ -1681,7 +1739,7 @@ class App(ttk.Frame):
                 except Exception:  # noqa: BLE001
                     names[unit] = str(unit)
             else:
-                names[unit] = str(unit)
+                names[unit] = self.save.names.get(unit, str(unit)) if self.save else str(unit)
         return names
 
     def icon_busy(self) -> bool:
@@ -1772,10 +1830,71 @@ class App(ttk.Frame):
                 units.append(int(part))
         return list(dict.fromkeys(units))
 
+    def _accessory_pool(self):
+        return tuple(dict.fromkeys([*self._pool_ids(), *(u for g in self.roster_groups for u in g.members)]))
+
+    def _accessory_config(self):
+        return dict(accessories=[k for k, var in self.accessory_vars.items() if var.get()],
+                    accessory_locks={u: self.accessory_locks[u] for u in self._accessory_pool()
+                                     if u in self.accessory_locks})
+
+    def _load_accessories(self, config):
+        for kind, var in self.accessory_vars.items():
+            var.set(kind in config.get("accessories", ()))
+        self.accessory_locks = {int(u): k for u, k in dict(config.get("accessory_locks", ())).items()
+                                if str(u).isdigit() and k in self.accessory_vars}
+
+    def choose_accessories(self):
+        from .roster import lineup_order
+        if not self.save or self.save.is_clan_battle:
+            return
+        units = lineup_order(self._accessory_pool())
+        if not units:
+            self._notice("先选择候选角色或添加角色分组。")
+            return
+        if self.roster_book is None:
+            try:
+                self._load_roster_book()
+            except ValueError as exc:
+                self._append_log(str(exc))
+        names = self._roster_names()
+        window = tk.Toplevel(self.master)
+        window.title("设置角色饰品")
+        window.transient(self.master)
+        window.geometry("470x440")
+        window.columnconfigure(0, weight=1)
+        window.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(window, highlightthickness=0, background=self.colors.panel)
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(window, command=canvas.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        canvas.configure(yscrollcommand=scroll.set)
+        rows = ttk.Frame(canvas, padding=8)
+        canvas.create_window(0, 0, window=rows, anchor="nw")
+        rows.bind("<Configure>", lambda _: canvas.configure(scrollregion=canvas.bbox("all")))
+        window.bind("<MouseWheel>", lambda event: canvas.yview_scroll(-int(event.delta / 120), "units"))
+        fields = {}
+        for i, unit in enumerate(units):
+            ttk.Label(rows, text=names.get(unit, str(unit))).grid(row=i, column=0, sticky="w", padx=5)
+            var = tk.StringVar(value=self.accessory_locks.get(unit, "跟随勾选"))
+            fields[unit] = var
+            for col, kind in enumerate(("跟随勾选", *self.accessory_vars), 1):
+                ttk.Radiobutton(rows, text=kind, variable=var, value=kind).grid(row=i, column=col, padx=3)
+        def apply():
+            self.accessory_locks = {u: var.get() for u, var in fields.items() if var.get() in self.accessory_vars}
+            self.save_settings()
+            window.destroy()
+        bar = ttk.Frame(window, padding=6)
+        bar.grid(row=1, column=0, columnspan=2, sticky="e")
+        ttk.Button(bar, text="保存", command=apply).pack(side="left")
+        ttk.Button(bar, text="取消", command=window.destroy).pack(side="left", padx=6)
+        self._center_window(window, parent=self.master)
+        window.grab_set()
+
     def _roster_settings(self):
         from .roster import RosterSettings, GroupSpec
 
-        pool = tuple(self._pool_ids()) or tuple(self.save.unit_ids if self.save is not None else ())
+        pool = self._accessory_pool() or tuple(self.save.unit_ids if self.save is not None else ())
         groups = [GroupSpec.from_dict(group.to_dict()) for group in self.roster_groups]
         return RosterSettings(
             endpoint=endpoint_for(self._port()),
@@ -1788,6 +1907,7 @@ class App(ttk.Frame):
             groups=tuple(groups),
             to_max_attr=bool(self.to_max_attr_var.get()),
             every_combo=bool(self.every_combo_var.get()),
+            **self._accessory_config(),
             verify=bool(self.verify_var.get()),
         )
 
@@ -1830,6 +1950,7 @@ class App(ttk.Frame):
     def _apply_roster_settings(self, settings) -> None:
         self.roster_pool_var.set(",".join(str(unit) for unit in settings.pool))
         self.roster_groups = [group for group in settings.groups]
+        self._load_accessories(settings.to_dict())
         self._refresh_groups()
         self.to_max_attr_var.set(bool(settings.to_max_attr))
         self.every_combo_var.set(bool(settings.every_combo))
@@ -2046,7 +2167,7 @@ class App(ttk.Frame):
             "ga": ("迭代", "代数", "", "刷新记录", "最高期望伤害", "场次"),
             "anneal": ("迭代", "步数", "", "温度", "最高期望伤害", "场次"),
             "cycle": ("模式", "层数", "", "记录", "最高期望伤害", "场次"),
-            "roster": ("队伍", "进度", "角色", "AUTO / SET", "最高期望伤害", "场次"),
+            "roster": ("队伍", "进度", "角色", "操作", "最高期望伤害", "场次"),
             "zero": ("进度", "阵容", "逐刀操作", "", "最高期望伤害", "场次"),
         }[mode]
         columns = self.result_tree["columns"]
@@ -2434,6 +2555,7 @@ class App(ttk.Frame):
             "roster": {
             "pool": [int(unit) for unit in self._pool_ids()],
             "groups": [group.to_dict() for group in self.roster_groups],
+            **self._accessory_config(),
             "to_max_attr": bool(self.to_max_attr_var.get()),
             "every_combo": bool(self.every_combo_var.get()),
             "verify": bool(self.verify_var.get()),
@@ -2565,6 +2687,7 @@ class App(ttk.Frame):
             ]
             self.to_max_attr_var.set(bool(roster.get("to_max_attr", True)))
             self.every_combo_var.set(bool(roster.get("every_combo", True)))
+            self._load_accessories(roster)
             self.verify_var.set(bool(roster.get("verify", True)))
             self._refresh_groups()  # 上次保存的分组要立刻显示出来（不然得先「新建」一次才看得见）
         zero = data.get("zero")
@@ -2629,7 +2752,7 @@ class App(ttk.Frame):
             elif mode == mode_registry.ANNEAL:
                 settings = self._anneal_settings()
             elif mode == mode_registry.ROSTER:
-                if not self._pool_ids():
+                if not self._accessory_pool():
                     raise ValueError("先在「候选角色」里挑人（或点「选择角色…」）。")
                 settings = self._roster_settings()
             elif mode == mode_registry.CYCLE:
@@ -2727,7 +2850,7 @@ class App(ttk.Frame):
         if self.session is not None:
             if not messagebox.askyesno(
                 TITLE,
-                "还在调帧。\n关闭窗口会直接退出（不会写回任何帧，已完成项留在 state.json）。\n现在停止并退出吗？",
+                f"{self._mode_spec().label}正在运行。\n关闭窗口会直接退出（不会写回任何帧，已完成项留在 state.json）。\n现在停止并退出吗？",
             ):
                 return
             self.session.cancel()
@@ -2755,6 +2878,7 @@ class App(ttk.Frame):
             if summary.get("teams"):
                 self.roster_results = [dict(item) for item in summary["teams"]]
                 self.roster_source = session.save
+                self.roster_result_settings = session.settings
             semantic = getattr(job, "history", None) is not None
             roster = getattr(job, "teams_total", None) is not None
             zero = getattr(job, "rounds_total", None) is not None
@@ -2797,7 +2921,7 @@ class App(ttk.Frame):
                     self.status_var.set(
                         f"完成：写回 {int(getattr(job, 'written', 0))} 项，结果轴已生成"
                     )
-                if not zero and (not roster or session.save.is_labyrinth):
+                if not zero and (not roster or not session.save.is_clan_battle):
                     workbook = getattr(session, "workbook", None) if session else None
                     if workbook is not None and Path(workbook).is_file():
                         self._load_result_axis(Path(workbook))
@@ -2824,7 +2948,7 @@ class App(ttk.Frame):
                 elif kind == "error":
                     self._append_log(f"[error] {payload}")
                     self.status_var.set("出错：见日志")
-                    self._report_error(f"调帧过程中出错：\n{payload}")
+                    self._report_error(f"{self._mode_spec().label}过程中出错：\n{payload}")
                     self._on_finished(-1)
                 elif kind == "icons":
                     done, total = payload
@@ -2924,14 +3048,14 @@ class App(ttk.Frame):
         if best is not None:
             counter += f" / 最优 {float(best.damage):,.0f}"
             if team and team != self.shown_team:
-                from .roster import lineup_combo, lineup_names
+                from .roster import lineup_text, lineup_names
 
                 self.shown_team = team
                 names = getattr(job, "names", None) or {}
                 self.result_tree.insert("", "end", values=(
                     f"第 {done} 支队伍", f"{done}/{total}",
                     lineup_names(team, names),
-                    lineup_combo(team, best.toggles),
+                    lineup_text(team, best.toggles, names),
                     f"{float(best.damage):,.0f}", getattr(job, "battles_done", ""),
                 ))
         self.counter_label.configure(text=counter)
@@ -2946,17 +3070,18 @@ class App(ttk.Frame):
         if best is not None:
             counter += f" / 最优 {float(best.damage):,.0f}"
             plan = tuple(tuple(bool(flag) for flag in row) for row in getattr(best, "plan", ()))
-            if plan and plan != getattr(self, "shown_zero", ()):
+            key = best.steps or plan
+            if key and key != getattr(self, "shown_zero", ()):
                 from .roster import lineup_names
                 from .zero import plan_text
 
-                self.shown_zero = plan
+                self.shown_zero = key
                 units = tuple(getattr(job, "units", ()) or ())
                 names = getattr(job, "names", None) or {}
                 self.result_tree.insert("", "end", values=(
                     f"{done}/{total}",
                     lineup_names(units, names) if units else "",
-                    plan_text(plan), "",
+                    "；".join(best.steps) if best.steps else plan_text(plan), "",
                     f"{float(best.damage):,.0f}",
                     getattr(job, "battles_done", ""),
                 ))
@@ -3081,7 +3206,7 @@ class App(ttk.Frame):
             if key == mode_registry.CYCLE:
                 stored = config.get("settings", {})
                 for name, var in self.cycle_vars.items():
-                    var.set(stored[name])
+                    var.set(stored.get(name, 0))
                 for name in ("battle_time", "seed", "samples", "batch_size", "timeout"):
                     getattr(self, name + "_var").set(stored[name])
             elif key == mode_registry.GA:
@@ -3094,6 +3219,9 @@ class App(ttk.Frame):
                 from .roster import RosterSettings
 
                 self._apply_roster_settings(RosterSettings.from_dict(config.get("settings") or {}))
+            elif key == mode_registry.ZERO:
+                from .zero import ZeroSettings
+                self._apply_zero_settings(ZeroSettings.from_dict(config.get("settings") or {}))
             else:
                 settings = JobSettings.from_dict(config.get("settings") or {})
                 search = SearchSettings.from_dict(config.get("search") or {})
@@ -3189,6 +3317,8 @@ class App(ttk.Frame):
 
     def _set_running(self, running: bool) -> None:
         state = "disabled" if running or self.save is None else "normal"
+        for control in self.accessory_controls:
+            control.configure(state="normal" if self.save and not self.save.is_clan_battle and not running else "disabled")
         self.start_button.configure(state=state)
         self.stop_button.configure(state="normal" if running else "disabled")
         self.open_dir_button.configure(state="disabled" if running else "normal")

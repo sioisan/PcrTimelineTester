@@ -48,6 +48,9 @@ class BattleOutcome:
     # Stats.UBTime：每个玩家实际放出 UB 的帧（用来判断「这一帧根本放不出来」）
     ub_frames: tuple[tuple[float, ...], ...] = ()
 
+    warnings: tuple[str, ...] = ()
+    first_expected: float | None = None
+
     @property
     def is_expected(self) -> bool:
         return self.expected is not None
@@ -222,6 +225,8 @@ class SimulatorClient:
             seed=seed,
             expected=expected,
             ub_frames=_ub_frames(stats),
+            warnings=tuple((result.get("OnceResult") or {}).get("warnings") or ()),
+            first_expected=expected,
         )
 
     # -------------------------------------------------------------- evaluate
@@ -271,6 +276,8 @@ class SimulatorClient:
                 seed=items[0].seed,
                 expected=(sum(expected) / len(expected)) if all(e is not None for e in expected) else None,
                 ub_frames=items[0].ub_frames,
+                warnings=tuple(dict.fromkeys(w for item in items for w in item.warnings)),
+                first_expected=items[0].first_expected,
             ))
         return outcomes
 

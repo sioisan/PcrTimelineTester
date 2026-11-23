@@ -127,3 +127,20 @@ def test_workbook_summary_rows_are_plain_values(tmp_path):
     assert first[0] == "角色1 UB1"
     assert first[1] == 1
     assert first[2] == "470 → 480"
+
+
+def test_failed_final_frame_replay_preserves_last_candidate_and_checkpoint(tmp_path):
+    import pytest
+    from PcrTimelineTester.client import TuneError
+    save, session, _ = _session(tmp_path, [[470], [500], [600], [700], [800]], {(0, 0): (480, 1000.)})
+    def offline():
+        raise TuneError("模拟服务未响应")
+    session.job._verify = offline
+    with pytest.raises(TuneError, match="最后候选已保存"):
+        session.run()
+    recovered = read_save(session.workbook)
+    assert recovered.frames[0] == [480]
+    assert read_save(save.path).frames[0] == [470]
+    assert (session.run_dir / STATE).is_file()
+    assert session.summary["error"] == "模拟服务未响应"
+    session.close()

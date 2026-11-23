@@ -330,7 +330,7 @@ def _run_ga(
 def _command_inspect(args: argparse.Namespace) -> int:
     mode = getattr(args, "mode", "frame") or "frame"
     save = mode_registry.get(mode).read_save(_path(args.excel))
-    if mode == mode_registry.CYCLE:
+    if mode in (mode_registry.CYCLE, mode_registry.ROSTER, mode_registry.ZERO):
         spec = mode_registry.get(mode)
         settings = spec.from_values({**_arg_overrides(spec, args), **_overrides(args)}, save)
         print(f"轴文件 {save.path.name}，队伍 {'、'.join(save.unit_names)}")
@@ -499,7 +499,11 @@ def _command_resume(args: argparse.Namespace) -> int:
         search_settings = SearchSettings.from_dict(config.get("search") or {})
         return _run_tune(save, job_settings, search_settings, run_dir, resume_state=state)
     saved = dict(config.get("settings") or {})
-    endpoint = saved.pop("endpoint", None) if mode == mode_registry.CYCLE else None
+    endpoint = saved.pop("endpoint", None)
+    if mode == mode_registry.CYCLE:
+        saved.setdefault("flat_layers", 0)
+        saved.setdefault("polish_stalls", 0)
+        saved.setdefault("review_seeds", 0)
     settings = spec.from_values(saved, save)
     if endpoint:
         settings = replace(settings, endpoint=getattr(args, "endpoint", None) or endpoint)

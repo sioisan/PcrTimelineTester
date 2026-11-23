@@ -34,7 +34,9 @@ POOL = tuple(range(1001, 1013))  # 12 个角色
 
 def _save(tmp_path, frames=None):
     frames = frames if frames is not None else [[470], [500], [600], [700], [800]]
-    return make_save(tmp_path, frames)
+    save = make_save(tmp_path, frames)
+    save.enemy_ids = [401911401]
+    return save
 
 
 def _settings(**overrides):
@@ -124,6 +126,9 @@ def test_ungrouped_group_is_merged_into_the_pool():
 
 # ---------------------------------------------------------------- 评估
 class FakeEvaluator:
+    def warm_pool(self, cancelled):
+        return len(self.settings.pool)
+
     """按 unitId 权重给分；toggles 只影响 0.5 的系数，方便验证「取最高」。"""
 
     def __init__(self, save, settings, weights=None):
@@ -202,7 +207,7 @@ def test_labyrinth_uses_each_units_gear_in_search_and_result(tmp_path, monkeypat
             probes.append(body)
             players = [{"unitId": p["unitId"], "level": 412,
                         "exEquip": [4110501, 4203501, 4305511] if p["unitId"] == newcomer
-                        else [4101501, 4201501, 4302511]} for p in reversed(players)]
+                        else [4101501, 4201501, 4302514]} for p in reversed(players)]
         return [{"Success": True, "CurrentSeed": body["Settings"]["RandomSeed"],
                  "PlayerList": players, "Stats": {"TotalDamage": 777, "UBTime": [[310]] * 5}}]
 
@@ -215,11 +220,11 @@ def test_labyrinth_uses_each_units_gear_in_search_and_result(tmp_path, monkeypat
             players = {p["unitId"]: p for p in body["PlayerList"]}
             assert players[original]["level"] == (412 if full else 67)
             assert players[original]["exEquip"] == [4101511, 4201503, 4302514]
-            assert players[newcomer]["exEquip"] == [4110511, 4203501, 4305514]
+            assert players[newcomer]["exEquip"] == [4110511, 4203501, 4305511]
             assert players[newcomer]["exEquipExceedRank"] == [0, 0, 5]
             assert players[newcomer]["exEquipSubs"] == {"0": [5, 4]*4, "1": [5, 4]*4, "2": [2, 4]*4}
             assert players[original]["exEquipSubs"]["2"] == [1, 4]*4
-            tuned = evaluator.labyrinth_result_save(team, flags)
+            tuned = evaluator.result_save(team, flags)
             assert tuned.group["playerData"]["playrCharacters"] == body["PlayerList"]
             assert tuned.frames == [[310]] * 5
             assert len(probes) == 1
@@ -403,6 +408,7 @@ def test_combos_do_not_need_a_frame_axis(tmp_path):
     """SET 只设 pressing（一有机会就按），和帧轴无关：没有帧轴照样能试 32 种。"""
     # 只有语义数据、没有帧轴的轴（帧模式读不了，阵容搜索照样能用）
     save = make_save(tmp_path, [], semantic=[[5, 10, 15], [10], [12], [20], [7]])
+    save.enemy_ids = [401911401]
     assert not save.frames and save.has_semantic
     settings = _settings(every_combo=True, pool=(1001, 1002, 1003, 1004, 1005))
     evaluator = TeamEvaluator(save, settings, log=lambda line: None)
@@ -450,14 +456,13 @@ def test_lineup_combo_follows_the_real_positions() -> None:
     assert lineup_combo(team, toggles, width=_width) == "XO"  # 站位顺序：1 花音 AUTO、2 蜘蛛 SET
 
 
-def test_lineup_text_numbers_the_positions() -> None:
+def test_lineup_text_binds_compact_operations_in_station_order() -> None:
     names = {136001: "蜘蛛", 134901: "花音", 128701: "星猫", 136201: "纳娜", 129701: "涅妃"}
     team = (136001, 134901, 128701, 136201, 129701)
     toggles = (True, False, False, False, True)
     text = lineup_text(team, toggles, names, width=_width)
     assert text == (
-        "1 花音 AUTO（X）、2 纳娜 AUTO（X）、3 星猫 AUTO（X）、"
-        "4 涅妃 SET（O）、5 蜘蛛 SET（O）"
+        "花音(X)、纳娜(X)、星猫(X)、涅妃(O)、蜘蛛(O)"
     )
     assert lineup_names(team, names, width=_width) == "花音、纳娜、星猫、涅妃、蜘蛛"
 
@@ -468,3 +473,58 @@ def test_shared_members_can_satisfy_more_than_five_combined_minima():
     teams = list(iter_teams(settings))
     assert len(teams) == team_count(settings) == 36
     assert all(set(shared) <= set(team) <= set(POOL) for team in teams)
+
+
+def test_warm_pool_covers_new_roles_before_formal_requests(tmp_path, monkeypatch):
+    pool = tuple(range(1001, 1013))
+    settings = _settings(pool=pool)
+    recorded = []
+    with TeamEvaluator(_save(tmp_path), settings) as evaluator:
+        monkeypatch.setattr(evaluator, "_post", lambda bodies: recorded.extend(bodies))
+        assert evaluator.warm_pool(lambda: False) == len(pool)
+    teams = [set(p["unitId"] for p in body["PlayerList"]) for body in recorded]
+    assert len(teams) == 3 and teams[0].isdisjoint(teams[1])
+    assert set.union(*teams) == set(pool)
+    assert all(body["BattleTime"] == 1 for body in recorded)
+
+
+def test_nonclan_gear_cross_product_scored_per_choice_and_seed(tmp_path):
+    from PcrTimelineTester.roster import accessory_options, normal_equipment
+    save = _save(tmp_path)
+    save.enemy_ids = [410000001]  # 特殊 Boss
+    team = tuple(reversed(save.unit_ids))
+    settings = _settings(pool=team, every_combo=True, samples=2, batch_size=8,
+                         accessories=("攻击", "防御"), accessory_locks={team[0]: "TP", team[1]: "防御"})
+    assert not save.is_clan_battle
+    class GearEvaluator(TeamEvaluator):
+        def _post(self, requests):
+            assert len(requests) <= self.settings.batch_size * POST_WORKERS
+            result = []
+            for body in requests:
+                gear = {p["unitId"]: p["exEquip"][2] % 1000 for p in body["PlayerList"]}
+                assert gear[team[0]] == 601 and gear[team[1]] == 519
+                score = sum(gear.values()) + sum(body["SetToggles"])
+                result.append(dict(damage=score, frames=500, result=2))
+            self.battles += len(result)
+            return result
+    from PcrTimelineTester.roster import POST_WORKERS
+    with GearEvaluator(save, settings) as evaluator:
+        evaluator._max_players = {u: {"unitId": u, "exEquip": [4101511, 4201503, 4301514]} for u in team}
+        best, = evaluator.evaluate([team])
+        assert best.accessories == ("TP", "防御", "防御", "防御", "防御")
+        assert all(best.toggles) and evaluator.battles == 8 * 32 * 2
+        rows = evaluator.evaluate_all(team)
+        assert len(rows) == 8 * 32 and rows[0][1] == best
+    assert normal_equipment({"unitId": team[0], "exEquip": [4101511,4201503,4301514]}, "TP")["exEquipSubs"]["2"] == [5,4]*4
+    assert accessory_options(settings, team, True) == ()
+    assert RosterSettings.from_dict(settings.to_dict()) == settings
+
+
+def test_accessory_defaults_and_clan_detection(tmp_path):
+    from PcrTimelineTester.roster import accessory_options
+    save = _save(tmp_path)
+    team = tuple(save.unit_ids)
+    assert accessory_options(_settings(pool=team), team, False) == (("攻击",),) * 5
+    for boss, clan in [(401911401, True), (410000001, False), (770423002, False), (501000001, False)]:
+        save.enemy_ids = [boss]
+        assert save.is_clan_battle is clan

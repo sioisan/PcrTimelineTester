@@ -12,6 +12,8 @@ interrupted run never leaves a half-tuned timeline behind.
 
 from __future__ import annotations
 
+from .recovery import verifying
+
 from dataclasses import dataclass, field
 import threading
 import time
@@ -254,7 +256,8 @@ class TuneJob:
         if not self.cancelled:
             self._refine_effects()
         if not self.cancelled:
-            self._verify()
+            with verifying(self.frames_copy(), self.current_metric):
+                self._verify()
             self.cancelled = self._cancel.is_set()
         elapsed = time.monotonic() - self._started
         self.log(

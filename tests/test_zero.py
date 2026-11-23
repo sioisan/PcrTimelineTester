@@ -198,6 +198,9 @@ def test_request_pure_toggles_every_slot(tmp_path):
 
 
 class FakeZero:
+    def anchor_search(self):
+        return None
+
     """假评估器：伤害随「按了几刀」线性上升。"""
 
     def __init__(self, save):
@@ -340,3 +343,26 @@ def test_moves_can_switch_a_suffix_and_two_nearby_teammates():
     neighbors = [mutate(start, rng, opportunities=times, limit=6) for _ in range(300)]
     assert any(row == (True, True, False, False, False, False) for plan in neighbors for row in plan)
     assert any(sum(row != orig for row, orig in zip(plan, start)) == 2 for plan in neighbors)
+
+
+def test_ally_ub_set_and_natural_auto_require_full_tp():
+    from PcrTimelineTester.zero_anchor import next_operations
+    units = (11, 22, 33, 44, 55)
+    def tp(role, frame, full):
+        return dict(TargetLaneIndex=role, Frame=frame, IsReadyAfter=full, CrossedReady=full)
+    stats = {"TpChangeEvents": [tp(1, 90, True), tp(2, 104, True), tp(3, 90, True), tp(3, 103, False)],
+             "SkillExecEvents": [dict(UnitId=u, StartFrame=95, EndFrame=110) for u in units]}
+    choices = next_operations(((100, 0),), stats, units)
+    assert choices[100.001, 1] == (True, "100 帧 1 号位 UB → 2 号位 SET（100 帧）")
+    assert choices[110, 1] == (False, "100 帧 1 号位 UB → 2 号位 AUTO（110 帧）")
+    assert (100.001, 2) not in choices and (110, 3) not in choices
+    assert (105, 1) not in choices
+
+
+def test_anchored_score_round_trips_the_same_frame_order():
+    from PcrTimelineTester.zero_anchor import cast_order, player_lanes
+    casts = ((1234., 4), (1234.001, 1), (1250., 2))
+    lanes = player_lanes(casts) + ((900.,),)
+    assert cast_order(lanes) == casts
+    score = ZeroScore(100, 5399, 2, (), lanes=lanes, steps=("同帧 SET", "收招 AUTO"))
+    assert ZeroScore.from_dict(score.to_dict()) == score

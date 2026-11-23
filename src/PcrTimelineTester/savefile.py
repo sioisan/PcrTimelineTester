@@ -298,6 +298,12 @@ class SaveFile:
         return self.boss_name or "Boss"
 
     @property
+    def is_clan_battle(self) -> bool:
+        # 与算器 GuildManager.IsGuildBossId 一致。41 开头属于特殊 Boss。
+        boss = self.enemy_ids[0] if self.enemy_ids else 0
+        return boss // 100_000_000 == 4 and boss // 10_000_000 != 41
+
+    @property
     def is_labyrinth(self) -> bool:
         return bool(self.enemy_ids and self.enemy_ids[0] // 10_000_000 == 77)
 
@@ -451,6 +457,8 @@ def write_tuned_save(
     semantic: list[list[int]] | None = None,
     sequence: tuple[int, ...] | None = None,
     sheet_name: str = SUMMARY_SHEET,
+    expected_damage: float | None = None,
+    auto_mode: bool = False,
 ) -> None:
     """Write a fresh importable workbook with the tuned axis.
 
@@ -463,7 +471,7 @@ def write_tuned_save(
     group = raw["playerGroupData"]
     axis = [list(row) for row in frames]
     group["UBExecTimeData"] = axis
-    group["useAutoMode"] = False
+    group["useAutoMode"] = auto_mode
     group["useSetMode"] = False
     if semantic is not None:
         group["SemanUBExecTimeData"] = [list(lane) for lane in semantic]
@@ -478,12 +486,12 @@ def write_tuned_save(
     raw["UBExecTime"] = axis
     raw["currentRandomSeed"] = battle_seed
     raw["totalDamage"] = int(damage)
-    raw["exceptDamage"] = 0
+    raw["exceptDamage"] = round(expected_damage / 10000) if expected_damage is not None else 0
     raw["backDamage"] = 0
     raw.pop("uBDetails", None)
     encoded = base64.b64encode(gzip.compress(json.dumps(raw, ensure_ascii=False).encode())).decode()
     if len(encoded) > CELL_LIMIT:
-        raise ValueError(f"调帧后的 {SAVE_SHEET} 超出 Excel 单元格容量（{len(encoded)} > {CELL_LIMIT}）")
+        raise ValueError(f"{sheet_name}的 {SAVE_SHEET} 超出 Excel 单元格容量（{len(encoded)} > {CELL_LIMIT}）")
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -495,7 +503,10 @@ def write_tuned_save(
             sheet.append(list(row))
         sheet.column_dimensions["A"].width = 22
         sheet.column_dimensions["B"].width = 52
-        sheet.column_dimensions["C"].width = 22
+        sheet.column_dimensions["C"].width = 60 if sheet_name == "阵容结果" else 22
+        if sheet_name == "阵容结果":
+            sheet.column_dimensions["D"].width = 18
+            sheet.column_dimensions["E"].width = 60
         base = _source_base_rows(Path(save.path))
         if base:
             # Keep 基础数据 so the tuned workbook still shows Chinese names when re-imported here.

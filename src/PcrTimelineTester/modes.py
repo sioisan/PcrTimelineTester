@@ -61,6 +61,12 @@ class Param:
             else:
                 raise ValueError(f"{self.label} 只能是逗号分隔的角色 ID（现在是 {value!r}）")
             return tuple(dict.fromkeys(items))
+        if self.kind == "accessories":
+            return tuple(filter(None, value.replace("，", ",").split(","))) if isinstance(value, str) else tuple(value)
+        if self.kind == "accessory_locks":
+            if isinstance(value, str):
+                return tuple(part.split("=") for part in value.split(",") if part)
+            return tuple(dict(value).items())
         if self.kind == "groups":
             from .roster import GroupSpec
 
@@ -124,6 +130,10 @@ class Param:
         """设置对象里的值 → 显示/保存用的字符串。"""
         if self.kind == "ids":
             return ",".join(str(int(item)) for item in (value or ()))
+        if self.kind == "accessories":
+            return ",".join(value)
+        if self.kind == "accessory_locks":
+            return ",".join(f"{unit}={kind}" for unit, kind in dict(value).items())
         if self.kind == "groups":
             parts = []
             for group in value or ():
@@ -551,7 +561,9 @@ ROSTER_PARAMS: tuple[Param, ...] = (
         (),
     ),
     Param("to_max_attr", "按满属性", "把这几个角色按满级满 Rank 算，否则沿用轴里的练度。", "bool", True),
-    Param("every_combo", "每队试 32 种 AUTO/SET", "关掉只打全 AUTO 一场（快 32 倍，但不试 SET）。", "bool", True),
+    Param("accessories", "非会战 EX 饰品", "用逗号分隔攻击、防御、TP。留空使用攻击。", "accessories", ()),
+    Param("accessory_locks", "角色饰品锁定", "角色ID=种类，多人用逗号分隔。", "accessory_locks", ()),
+    Param("every_combo", "每队试 32 种 AUTO/SET", "关掉只打全 SET 一种。", "bool", True),
     Param("verify", "跑完复核", "导出前用最优阵容再打一场确认伤害。", "bool", True),
 )
 
@@ -577,6 +589,7 @@ def _roster_build(values: dict[str, Any], save: SaveFile):
         groups=groups,
         to_max_attr=bool(values["to_max_attr"]),
         every_combo=bool(values["every_combo"]),
+        accessories=values["accessories"], accessory_locks=values["accessory_locks"],
         verify=bool(values["verify"]),
     )
 
@@ -600,6 +613,9 @@ def _roster_plan(save: SaveFile, settings) -> list[str]:
         f"共 {total} 支队伍 × {combo_text} × {max(1, int(settings.samples))} 个种子 = {total * combos * max(1, int(settings.samples))} 场",
         f"属性 {'满级满 Rank' if settings.to_max_attr else '沿用轴里的练度'}",
     ]
+    if save and not save.is_clan_battle:
+        lines[2] = f"共 {total} 支队伍，每套饰品 × {combo_text} × {settings.samples} 个种子"
+        lines.append("非会战饰品：" + "、".join(settings.accessories or ("攻击",)))
     for group in settings.groups:
         if group.members:
             lines.append(f"分组 {group.label}")
@@ -670,7 +686,7 @@ def _zero_plan(save: SaveFile, settings) -> list[str]:
     lines += [
         f"共 {int(settings.iterations)} 轮 × 每轮 {int(settings.batch)} 个候选 × {seeds} 个种子"
         f" ≈ {int(settings.iterations) * int(settings.batch) * seeds} 场"
-        "（0 押：只在「TP 满了」的帧上决定按不按，O = 按、X = 交给 AUTO）",
+        "（0 押：自身 TP 满或队友开 UB 时可 SET，AUTO 可等当前技能收招）",
         f"每个角色最多排 {int(settings.ub_limit)} 刀（可排几刀跟着回包里的 TP 满帧条数走，刀数本来就会随打法变化）",
         f"属性 {'满级满 Rank' if settings.to_max_attr else '沿用轴里的练度'}",
     ]
@@ -704,9 +720,12 @@ def _cycle_session(save, settings, run_dir, **kwargs):
 
 
 CYCLE_PARAMS = (
+    Param("flat_layers", "分层持平上限", "连续几层没有新高就转精调。0 跑满搜索层数。关闭精调时也跑满。", "int", 4, 0, 100),
+    Param("polish_stalls", "精调持平轮数", "从最高轴继续搜索，连续几轮没有提升就结束精调。0 只跑分层搜索。", "int", 2, 0, 20),
+    Param("review_seeds", "配对复测种子数", "原轴与成品使用相同种子逐场比较，0 跳过配对统计。", "int", 32, 0, 4096),
     Param("depth", "搜索层数", "允许连续改动几步，每层重新读取事件。", "int", 4, 1, 100),
     Param("width", "保留分支", "每层保留多少种循环继续探索。", "int", 4, 1, 32),
-    Param("candidates", "每支候选", "每个分支最多测试几种新操作。", "int", 64, 4, 1024),
+    Param("candidates", "每支候选", "每支的基础候选预算。最高轴另试跨窗、联动及组合。", "int", 64, 4, 1024),
 )
 register(ModeSpec(
     key=CYCLE, label="循环搜索", description="按实际充能、跳伤和动作循环增删 UB，保留多步联动分支。",
@@ -714,5 +733,6 @@ register(ModeSpec(
     params=CYCLE_PARAMS + tuple(p for p in FRAME_PARAMS if p.name in
                                 ("battle_time", "seed", "samples", "batch_size", "timeout")),
     build=_cycle_build, session=_cycle_session,
-    plan=lambda save, s: [f"连续搜索 {s.depth} 层，每层保留 {s.width} 个分支，每支最多试 {s.candidates} 条轴。"],
+    plan=lambda save, s: [f"连续搜索 {s.depth} 层，每层保留 {s.width} 个分支，每支基础候选 {s.candidates} 条，最高轴加测联动。",
+                          f"精调持平轮数 {s.polish_stalls}，配对复测种子数 {s.review_seeds}。"],
 ))

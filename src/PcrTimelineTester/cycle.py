@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from .recovery import keep_failed_candidate, verifying
+
 from collections import defaultdict
 from dataclasses import asdict, dataclass
-from itertools import zip_longest
+from itertools import combinations, islice, permutations, zip_longest
 from random import Random
 from pathlib import Path
 from threading import Event
@@ -30,6 +32,9 @@ class CycleSettings:
     depth: int = 4
     width: int = 4
     candidates: int = 64
+    polish_stalls: int = 0
+    review_seeds: int = 0
+    flat_layers: int = 4
 
 
 Axis = tuple[tuple[float, ...], ...]
@@ -104,17 +109,28 @@ class Trace:
             src = slot.get(e.get("SourceUnitId"))
             if src is not None and (src != r or e.get("OverflowDelta", 0) > 0) and e.get("IsIncrease"):
                 self.charges.append((frame, src, r, e.get("OverflowDelta", 0)))
+        self.damage_hits = defaultdict(lambda: defaultdict(int))
+        self.defense_ends = []
         for e in stats.get("HitTraceEvents") or ():
             r = slot.get(e.get("SourceUnitId"))
             if r is not None and e.get("Damage", 0) > 0:
                 f = e["Frame"]
                 self.edges[r].add(f)
+                target = e.get("TargetUnitId")
+                if target is not None and target not in slot:
+                    self.damage_hits[target, e.get("DamageTypeName")][f, r] += e["Damage"]
                 self.hits[r, e.get("SkillId"), e.get("ActionId")].append(f)
         for e in stats.get("SkillExecEvents") or ():
             r = slot.get(e.get("UnitId"))
             if r is not None:
                 self.edges[r].update((e.get("StartFrame", 0), e.get("EndFrame", 0)))
         for e in stats.get("BuffDebuffEvents") or ():
+            source = slot.get(e.get("SourceUnitId"))
+            defense = e.get("BuffParamKindName")
+            if (e.get("IsBuff") is False and source is not None and defense in ("DEF", "MAGIC_DEF")
+                    and e.get("EndFrame", -1) > 0 and e.get("Value", 0) < 0):
+                self.defense_ends.append((e["EndFrame"], e.get("StartFrame", 0), source,
+                                          e.get("TargetUnitId"), "ATK" if defense == "DEF" else "MGC"))
             for uid in (e.get("SourceUnitId"), e.get("TargetUnitId")):
                 if uid in slot:
                     self.edges[slot[uid]].update((e.get("StartFrame", 0), e.get("EndFrame", 0)))
@@ -230,6 +246,83 @@ def phase_moves(axis, trace):
     return interleave(per_role)
 
 
+def burst_moves(axis, trace):
+    """用同一目标、同类伤害的高伤跳数定位破防结束后的空档。"""
+    proposals = {}
+    for end, start, source, target, damage_type in trace.defense_ends:
+        hits = trace.damage_hits.get((target, damage_type), {})
+        for (frame, attacker), damage in hits.items():
+            gap = frame - end
+            if not 0 <= gap < 90:
+                continue
+            edits = []
+            for role, event, shift, reason in (
+                (attacker, frame, -gap - 1, "让爆发落在减防结束前"),
+                (source, start, gap + 1, "把减防窗口延续到下一次爆发"),
+            ):
+                old = next((v for v in reversed(axis[role]) if 0 <= event - base_frame(v) <= 240), None)
+                if old is not None:
+                    move = Move("对齐破防", role, old, with_frac(old, base_frame(old) + shift), reason)
+                    proposals[move] = max(damage, proposals.get(move, 0))
+                    edits.append(move)
+            if len(edits) == 2 and attacker != source:
+                pair = GroupMove(tuple(edits))
+                proposals[pair] = max(damage, proposals.get(pair, 0))
+    return sorted(proposals, key=proposals.get, reverse=True)
+
+
+def interval_moves(axis, trace, end, layer):
+    """把满 TP 提前排入循环，再试移除后面的一次输入；也在相邻刀界内轮换取样。"""
+    exchanges, scans = [], []
+    for role, lane in enumerate(axis[:5]):
+        for t in trace.ready[role]:
+            if any(base_frame(v) == t for v in lane):
+                continue
+            following = [v for v in lane if v > t][:3]
+            for distance, old in enumerate(following):
+                # 靠近已排 UB 的满 TP 时机优先，后两刀也可能因提前消费而失效。
+                exchanges.append((following[0] - t, distance, Move("换循环", role, old, t, "满 TP 补刀并撤后刀")))
+        for i, old in enumerate(lane):
+            f = base_frame(old)
+            low = max(FRAME_FLOOR, f - 100, base_frame(lane[i-1]) + 1 if i else FRAME_FLOOR)
+            high = min(end, f + 100, base_frame(lane[i+1]) - 1 if i+1 < len(lane) else end)
+            for dest in (low, high, (low + f)//2, (high + f)//2):
+                if dest != f:
+                    scans.append(Move("调帧", role, old, with_frac(old, dest), "相邻 UB 间分段取样"))
+    rng = Random(5323 + layer)
+    rng.shuffle(scans)
+    exchanges.sort(key=lambda v: v[:2])
+    return interleave(([move for _, _, move in exchanges], scans))
+
+
+def combined_axes(parent, branches, limit):
+    """只合并从同一父轴实测得分的分支，重叠或会改变刀序的编辑交给下一层。"""
+    seen = set()
+    for left, right in combinations(branches, 2):
+        rows = []
+        for original, a, b in zip(parent.axis, left.axis, right.axis, strict=True):
+            if a == b or b == original:
+                merged = a
+            elif a == original:
+                merged = b
+            elif len(original) == len(a) == len(b):
+                if any(x != o and y != o and x != y for o, x, y in zip(original, a, b)):
+                    break
+                merged = tuple(y if x == o else x for o, x, y in zip(original, a, b))
+                if any(base_frame(x) >= base_frame(y) for x, y in zip(merged, merged[1:])):
+                    break
+            else:
+                break
+            rows.append(merged)
+        else:
+            axis = tuple(rows)
+            if axis not in seen and axis not in (parent.axis, left.axis, right.axis):
+                seen.add(axis)
+                yield axis, (left.path[-1], right.path[-1])
+                if len(seen) >= limit:
+                    return
+
+
 def segment_moves(axis, trace, donors, rng, limit):
     """同时改一个时间段内数位角色，允许这一段整体换成另一次回放的出手次序。"""
     times = sorted({base_frame(v) for lane in axis[:5] for v in lane})
@@ -298,7 +391,91 @@ def moves(axis, trace, end, limit, donors=(), layer=0):
     return found
 
 
+def polish_moves(axis, trace, end, limit, round_no):
+    """分别给单刀、双人联动、连开换序和增删刀留出预算。"""
+    rng = Random(8017 + round_no)
+    slots = sorted((base_frame(v), role, v) for role, row in enumerate(axis[:5]) for v in row)
+    fine, singles, pairs, orders, structure = [], [], [], [], []
+
+    def shift(role, old, offset):
+        return Move("调帧", role, old, with_frac(old, base_frame(old) + offset), "实放时机精调")
+
+    for frame, role, old in slots:
+        fine.extend(shift(role, old, d) for d in (-1, 1))
+        singles.extend(shift(role, old, d) for d in (-90, -30, -8, -2, 2, 8, 30, 90))
+        structure.append(Move("删刀", role, old, None, "比较保留小技能"))
+    for (f, i, a), (g, j, b) in combinations(slots, 2):
+        if i == j or g - f > 180:
+            continue
+        for d in (-1, 1):
+            fine.append(GroupMove((shift(i, a, d), shift(j, b, d))))
+        for d in (-8, -2, 2, 8):
+            pairs.append(GroupMove((shift(i, a, d), shift(j, b, d))))
+        if 0 < g - f <= 12:
+            for t in (f, g):
+                for first, second in (((i, a), (j, b)), ((j, b), (i, a))):
+                    # 不占用第三人的同帧顺序。
+                    if any(k not in (i, j) and h == t for h, k, _ in slots):
+                        continue
+                    orders.append(GroupMove(tuple(
+                        Move("换序", r, v, t + n / 1000, "相邻两人连开")
+                        for n, (r, v) in enumerate((first, second)))))
+    for t in sorted({f for f, _, _ in slots}):
+        group = [(role, v) for frame, role, v in slots if frame == t]
+        if len(group) < 2 or len({r for r, _ in group}) != len(group):
+            continue
+        tails = sorted(v for _, v in group)
+        if len(set(tails)) != len(tails):
+            tails = [t + n / 1000 for n in range(len(group))]
+        for order in permutations(group):
+            orders.append(GroupMove(tuple(Move("换序", r, v, dest, "同帧释放顺序")
+                                          for (r, v), dest in zip(order, tails) if v != dest)))
+    for role, row in enumerate(trace.ready):
+        for t in row:
+            structure.append(Move("补刀", role, None, t, "TP 到账时试加一发"))
+        structure.append(Move("补刀", role, None, end - 1, "收尾试加一发"))
+    groups = [singles, pairs, orders, structure, joint_moves(axis, trace),
+              list(phase_moves(axis, trace)), list(suffix_moves(axis, trace, ()))]
+    # 一帧联动不依赖单刀预筛，完整覆盖每一对相邻队友。
+    found = {}
+    for move in fine:
+        proposal = move.apply(axis, end)
+        if proposal is not None and proposal != axis:
+            found.setdefault(proposal, move)
+    for group in groups:
+        rng.shuffle(group)
+        added = 0
+        for move in group:
+            proposal = move.apply(axis, end)
+            if proposal is None or proposal == axis or proposal in found:
+                continue
+            found[proposal] = move
+            added += 1
+            if added >= limit:
+                break
+    return found
+
+
 class CycleClient(SimulatorClient):
+    def paired_review(self, original, best, seeds, cancelled):
+        rows = []
+        size = max(1, self.batch_size // 2)
+        for pos in range(0, len(seeds), size):
+            if cancelled():
+                break
+            requests = [self.request_for(axis, seed) for seed in seeds[pos:pos + size]
+                        for axis in (original, best)]
+            results = self._post(requests)
+            for j, seed in enumerate(seeds[pos:pos + size]):
+                pair = results[2*j:2*j + 2]
+                a, b = (self._outcome(r, seed, k + 1) for k, r in enumerate(pair))
+                rows.append(dict(seed=seed, original_metric=a.metric, best_metric=b.metric,
+                                 original_damage=a.damage, best_damage=b.damage,
+                                 original_frames=a.battle_frames, best_frames=b.battle_frames,
+                                 original_warnings=(pair[0].get("OnceResult") or {}).get("warnings") or [],
+                                 best_warnings=(pair[1].get("OnceResult") or {}).get("warnings") or []))
+        return rows
+
     def verify_export(self, exported, settings):
         # 从刚读回的文件重新取队伍、Boss、练度、世界线和种子。
         if exported.battle_seed != settings.seed:
@@ -313,7 +490,7 @@ class CycleClient(SimulatorClient):
 
     def trace(self, axis, units, duration):
         request = self.request_for(axis, self.seeds[0])
-        request.update(CalcStats=511, ActionProgressFrames=list(range(30, duration * 60, 30)))
+        request.update(CalcStats=1 | 2 | 4 | 16 | 32 | 256, ActionProgressFrames=list(range(30, duration * 60, 30)))
         row = self._post([request])[0]
         self._outcome(row, self.seeds[0], 1)
         return Trace(row["Stats"], units)
@@ -341,6 +518,7 @@ class CycleJob:
         self.results = {}
         self.prior_battles = 0
         self.traces = {}
+        self.polish_history = []
         self.donors = []
         self.by_count = {}
         if state and state.get("mode") != "cycle":
@@ -351,6 +529,7 @@ class CycleJob:
             self.frontier = [Branch.restore(v) for v in state["frontier"]]
             self.expanded = {axis_key(v) for v in state["expanded"]}
             self.history = list(state["history"])
+            self.polish_history = list(state.get("polish_history", []))
             self.donors = [axis_key(d) for d in state.get("donors", ())]
             self.by_count = {int(k): Branch.restore(v) for k,v in state.get("by_count", {}).items()}
             self.prior_battles = state["battles"]
@@ -365,7 +544,7 @@ class CycleJob:
     def checkpoint(self):
         return dict(mode="cycle", baseline=asdict(self.baseline) if self.baseline else None,
                     best=asdict(self.best) if self.best else None, frontier=[asdict(b) for b in self.frontier],
-                    expanded=sorted(self.expanded), history=self.history, battles=self.simulations, donors=self.donors,
+                    expanded=sorted(self.expanded), history=self.history, polish_history=self.polish_history, battles=self.simulations, donors=self.donors,
                     by_count={k: asdict(v) for k, v in self.by_count.items()})
 
     def evaluate(self, proposals):
@@ -428,7 +607,25 @@ class CycleJob:
         for b in self.frontier:
             if self.stop.is_set():
                 return
-            for axis, move in moves(b.axis, self.trace(b), end, self.settings.candidates, self.donors, len(self.history)).items():
+            trace = self.trace(b)
+            limit = self.settings.candidates
+            choices = moves(b.axis, trace, end, limit, self.donors, len(self.history))
+            if b.axis == self.best.axis:
+                # 在当前最高轴上立即扫相邻两刀之间的局部时机，包含提前排队与同帧联动。
+                probes = polish_moves(b.axis, trace, end, max(1, limit // 8), len(self.history))
+                targeted = islice(interval_moves(b.axis, trace, end, len(self.history)), limit)
+                bursts = burst_moves(b.axis, trace)[:max(1, limit // 4)]
+                for move in (*bursts, *targeted):
+                    candidate = move.apply(b.axis, end)
+                    if candidate is not None and candidate != b.axis:
+                        choices.setdefault(candidate, move)
+                # 层内只给精调一个候选预算。完整的一帧扫描留到收尾阶段。
+                sample = list(probes)
+                if len(sample) > limit:
+                    sample = Random(2927 + len(self.history)).sample(sample, limit)
+                for candidate in sample:
+                    choices.setdefault(candidate, probes[candidate])
+            for axis, move in choices.items():
                 if axis in self.expanded or axis in parents or axis in proposals:
                     continue
                 proposals[axis] = (*b.path, move.describe(self.names))
@@ -437,6 +634,31 @@ class CycleJob:
         if self.stop.is_set():
             return
         width = self.settings.width
+        # 用已测成绩快速组合两处相容改动；父轴不同时不能直接拼接。
+        extra = {}
+        for parent in self.frontier:
+            picks = []
+            behaviors = set()
+            for branch in ranked:
+                if sources[branch.axis][0] != parent or branch.metric < parent.metric:
+                    continue
+                key = self.behavior[branch.axis]
+                if key not in behaviors:
+                    picks.append(branch)
+                    behaviors.add(key)
+                if len(picks) == 12:
+                    break
+            for axis, reasons in combined_axes(parent, picks, max(1, self.settings.candidates // 4)):
+                if axis in proposals or axis in extra or axis in parents or axis in self.expanded:
+                    continue
+                extra[axis] = (*parent.path, "组合高分分支：" + "；".join(reasons))
+                sources[axis] = parent, "组合"
+        if extra:
+            ranked.extend(self.evaluate(extra))
+            if self.stop.is_set():
+                return
+            ranked.sort(key=lambda b: -b.metric)
+            proposals.update(extra)
         if ranked:
             # 同分同实放帧通常只是输入表中多了一个没有放出的 UB。
             # 只折叠本层父代名额，下一层仍可由不同循环生成该输入。
@@ -454,11 +676,14 @@ class CycleJob:
                 variants.setdefault(b.counts, b)
             more = sorted(variants.values(), key=lambda b: (sum(b.counts), b.metric), reverse=True)
             shortlist.extend(more[:width])
-            for kind in ("调充能", "删刀", "补刀", "调帧", "重排", "联动", "换循环", "换段"):
-                shortlist.extend([b for b in ranked if sources[b.axis][1] == kind][:width])
+            # 每个操作家族先选评分最高的代表，只为可能入围的轴请求大回放。
+            for kind in ("调充能", "删刀", "补刀", "调帧", "重排", "联动", "换循环", "换段", "对齐破防", "组合"):
+                representative = next((b for b in ranked if sources[b.axis][1] == kind), None)
+                if representative:
+                    shortlist.append(representative)
             distinct = list(dict.fromkeys(shortlist))
             evidence = {}
-            for b in distinct:
+            for b in distinct if width > 1 else ():
                 if self.stop.is_set():
                     return
                 parent, _ = sources[b.axis]
@@ -487,10 +712,48 @@ class CycleJob:
             next_frontier = []
         self.behavior.clear()
         self.expanded.update(parents)
+        # 在探索其它循环的同时给历史最高轴留一个名额。每层轮换取样。
+        if width > 1 and next_frontier and all(b.axis != self.best.axis for b in next_frontier):
+            next_frontier[-1] = self.best
         self.frontier = next_frontier
         self.traces = {b.axis: self.traces[b.axis] for b in next_frontier if b.axis in self.traces}
         self.history.append(dict(damage=self.best.metric, simulations=self.simulations))
         self.log(f"第 {len(self.history)} 层测试 {len(proposals)} 条轴，保留 {len(next_frontier)} 个分支。")
+
+
+    def polish(self):
+        parent = self.best
+        round_no = len(self.polish_history)
+        end = min(FRAME_CEILING, self.settings.battle_time * 60 - 1)
+        proposals = polish_moves(parent.axis, self.trace(parent), end, self.settings.candidates, round_no)
+        paths = {axis: (*parent.path, move.describe(self.names)) for axis, move in proposals.items()}
+        ranked = self.evaluate(paths)
+        if self.stop.is_set():
+            return
+        self.record_counts(ranked)
+        for candidate in sorted(ranked, key=lambda b: -b.metric):
+            if candidate.metric <= parent.metric:
+                break
+            # 排队或未消费的输入可能虚增刀数，以实放轴再打一遍。
+            actual = self.behavior[candidate.axis] + candidate.axis[5:]
+            if self.stop.is_set():
+                return
+            with verifying(actual, candidate.metric):
+                replay = self.client.evaluate([actual])[0]
+            if (replay.metric == candidate.metric and replay.ub_frames[:5] == actual[:5]
+                    and not replay.warnings and (replay.result == 0 or replay.battle_frames >= end)):
+                self.best = Branch(actual, candidate.metric, candidate.counts, candidate.path)
+                self.record_counts([self.best])
+                break
+        self.behavior.clear()
+        self.traces = {p: t for p, t in self.traces.items() if p == self.best.axis}
+        gain = self.best.metric - parent.metric
+        self.polish_history.append(dict(damage=self.best.metric, gain=gain, candidates=len(paths)))
+        self.log(f"精调第 {round_no + 1} 轮，测试 {len(paths)} 条轴，整场提升 {gain:,.0f}。")
+
+    def needs_polish(self):
+        n = self.settings.polish_stalls
+        return n > 0 and (len(self.polish_history) < n or any(r["gain"] > 0 for r in self.polish_history[-n:]))
 
 
 class CycleSession:
@@ -516,22 +779,49 @@ class CycleSession:
     def close(self):
         self.job.client.close()
 
+    @keep_failed_candidate
     def run(self):
         job = self.job
         if job.baseline is None and not self.cancelled_requested:
             job.initialize()
         while job.frontier and len(job.history) < self.settings.depth and not self.cancelled_requested:
+            n = self.settings.flat_layers
+            if n and self.settings.polish_stalls and len(job.history) >= n:
+                previous = job.history[-n-1]["damage"] if len(job.history) > n else job.baseline.metric
+                if job.history[-1]["damage"] <= previous:
+                    self.log(f"连续 {n} 层没有新高，转入最高轴精调。")
+                    break
             job.advance()
             write_json(self.run_dir / STATE, job.checkpoint())
         write_json(self.run_dir / STATE, job.checkpoint())
         if self.cancelled_requested:
             return 130
+        while job.needs_polish() and not self.cancelled_requested:
+            job.polish()
+            write_json(self.run_dir / STATE, job.checkpoint())
+        if self.cancelled_requested:
+            return 130
         best, base = job.best, job.baseline
+        paired = []
+        if self.settings.review_seeds:
+            seeds = JobSettings(seed=self.settings.seed, samples=self.settings.review_seeds).seeds()
+            with verifying(best.axis, best.metric):
+                paired = job.client.paired_review(base.axis, best.axis, seeds, job.stop.is_set)
+            if self.cancelled_requested:
+                return 130
         lines = [f"起点期望伤害 {base.metric:,.0f}，实际 UB {base.counts}",
                  f"最终期望伤害 {best.metric:,.0f}，实际 UB {best.counts}",
                  f"实际 UB 次数按首个种子统计，位号顺序为 {'、'.join(job.names)}。",
                  *best.path, "实放总次数及各自最高整场期望伤害",
                  *(f"{n} 发　{b.metric:,.0f}　{b.counts}" for n,b in sorted(job.by_count.items()))]
+        if job.polish_history:
+            lines.append(f"精调 {len(job.polish_history)} 轮，连续 {self.settings.polish_stalls} 轮持平。")
+        if paired:
+            for key, label in (("metric", "评分（优先蓝字）"), ("damage", "黑字")):
+                gains = [r[f"best_{key}"] - r[f"original_{key}"] for r in paired]
+                lines.append(f"{label}配对 {len(gains)} 组，胜 {sum(g > 0 for g in gains)} 组，"
+                             f"平均差 {sum(gains)/len(gains):+,.1f}，范围 {min(gains):+,.0f} 至 {max(gains):+,.0f}。")
+            lines.append(f"成品出现释放警告 {sum(bool(r['best_warnings']) for r in paired)} 场。")
         winners = {"循环搜索结果.xlsx": best}
         extra = [b for n, b in job.by_count.items() if n > sum(base.counts)]
         if extra:
@@ -543,15 +833,18 @@ class CycleSession:
             for name, b in winners.items():
                 if self.cancelled_requested:
                     return 130
-                out = job.client.evaluate([b.axis])[0]
-                rows = lines if b == best else [f"期望伤害 {b.metric:,.0f}，实际 UB {b.counts}", *b.path]
-                pending = Path(staging) / name
-                write_tuned_save(pending, self.save, b.axis, battle_seed=self.settings.seed,
-                                 damage=out.damage, summary=[["循环搜索"]] + [[line] for line in rows])
-                exported = read_save(pending, require_frames=False, allow_empty=True)
-                check = job.client.verify_export(exported, self.settings)
-                if check.metric != b.metric or tuple(map(len, check.ub_frames[:5])) != b.counts:
-                    raise TuneError(f"{name} 读回复核与搜索成绩或实放 UB 次数不一致，请检查算器和数据版本。")
+                with verifying(b.axis, b.metric, notes=[["分支", name], *[[step] for step in b.path]]):
+                    out = job.client.evaluate([b.axis])[0]
+                    rows = lines if b == best else [f"期望伤害 {b.metric:,.0f}，实际 UB {b.counts}", *b.path]
+                    pending = Path(staging) / name
+                    write_tuned_save(pending, self.save, b.axis, battle_seed=self.settings.seed,
+                                     damage=out.damage, expected_damage=out.first_expected, summary=[["循环搜索"]] + [[line] for line in rows])
+                    exported = read_save(pending, require_frames=False, allow_empty=True)
+                    check = job.client.verify_export(exported, self.settings)
+                    if (check.metric != b.metric or check.ub_frames[:5] != out.ub_frames[:5]
+                            or check.damage != out.damage or check.battle_frames != out.battle_frames
+                            or tuple(map(len, check.ub_frames[:5])) != b.counts):
+                        raise TuneError(f"{name} 读回复核与搜索成绩或实放 UB 次数不一致，请检查算器和数据版本。")
             if self.cancelled_requested:
                 return 130
             for name in winners:
@@ -560,7 +853,8 @@ class CycleSession:
         self.summary = dict(mode="cycle", baseline=base.metric, final=best.metric, ub_before=base.counts,
                             ub_after=best.counts, path=best.path, branches=list(winners)[1:],
                             best_by_count={n: b.metric for n, b in job.by_count.items()},
-                            battles=job.simulations, result_workbook=str(self.workbook))
+                            battles=job.simulations, polish_history=job.polish_history,
+                            paired_review=paired, result_workbook=str(self.workbook))
         write_json(self.run_dir / REPORT_JSON, self.summary)
         (self.run_dir / REPORT_MD).write_text("# 循环搜索\n\n" + "\n\n".join(lines), encoding="utf8")
         self.log(f"读回复核通过，结果轴 {self.workbook}")

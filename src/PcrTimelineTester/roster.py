@@ -23,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor
 import httpx
 
 from .client import TuneError, _expected_damage, simulation_url
-from .datas import unit_width
+from .datas import unit_talent, unit_width
 from .savefile import SaveFile, UNIT_FIELDS, frame_axis
 
 ROLE_KEYS = ("unitId", "level", "rarity", "rank", "equipLevel", "skillLevel")
@@ -31,10 +31,11 @@ DEFAULT_ENDPOINT = "http://127.0.0.1:8080/simulate"
 TEAM_SIZE = 5
 POST_WORKERS = 4  # 同时发几个请求（服务端本身是多线程的，串行发吃不满 CPU）
 RESULT_LIMIT = 100
-LABYRINTH_EX = "武器 20 贯通、防具 12 贯通、首饰 8% 攻击"
+ACCESSORIES = ("攻击", "防御", "TP")
+NORMAL_EX = "武器 20 贯通、防具 12 贯通"
 
 
-def labyrinth_equipment(player: dict) -> dict:
+def normal_equipment(player: dict, kind: str) -> dict:
     """算器返回该角色可穿的三个类别，按装备表选择有目标词条的虹装。"""
     slots = player.get("exEquip")
     if not isinstance(slots, list) or len(slots) != 3 or not all(type(i) is int for i in slots):
@@ -44,12 +45,22 @@ def labyrinth_equipment(player: dict) -> dict:
         raise TuneError(f"角色 {player.get('unitId')} 的 EX 装备类别无法匹配黎明配装：{slots}")
     # 四条满档词条。首饰的物攻在索引 1，魔攻在索引 2。
     atk_index = 1 if accessory <= 4303 else 2
+    suffix = slots[2] % 1000
+    if kind == "TP":
+        accessory_id, sub_index, rank = 601, 5, 0
+    else:
+        # 算器优先返回适合该角色属性的攻击虹饰品。
+        talent = (suffix - 511) % 5 + 1 if 511 <= suffix <= 520 else unit_talent(player["unitId"])
+        if talent not in range(1, 6):
+            raise TuneError(f"无法识别角色 {player['unitId']} 的饰品属性")
+        accessory_id = (510 if kind == "攻击" else 515) + talent
+        sub_index, rank = atk_index, 5
     return {
         "exEquip": [weapon * 1000 + 511, armor * 1000 + (503 if armor == 4201 else 501),
-                    accessory * 1000 + 514],
+                    accessory * 1000 + accessory_id],
         "exEquipLevel": [0, 0, 0],
-        "exEquipExceedRank": [0, 5 if armor == 4201 else 0, 5],
-        "exEquipSubs": {"0": [5, 4] * 4, "1": [5, 4] * 4, "2": [atk_index, 4] * 4},
+        "exEquipExceedRank": [0, 5 if armor == 4201 else 0, rank],
+        "exEquipSubs": {"0": [5, 4] * 4, "1": [5, 4] * 4, "2": [sub_index, 4] * 4},
     }
 
 
@@ -115,6 +126,8 @@ class RosterSettings:
     to_max_attr: bool = True
     verify: bool = True
     every_combo: bool = True
+    accessories: tuple[str, ...] = ()
+    accessory_locks: tuple[tuple[int, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not 1 <= int(self.battle_time) <= 90:
@@ -129,6 +142,12 @@ class RosterSettings:
         object.__setattr__(self, "pool", pool)
         if len(pool) < TEAM_SIZE:
             raise ValueError(f"候选角色至少要有 {TEAM_SIZE} 个（当前 {len(pool)} 个）")
+        choices = tuple(dict.fromkeys(self.accessories))
+        locks = {int(unit): kind for unit, kind in dict(self.accessory_locks).items()}
+        if any(kind not in ACCESSORIES for kind in (*choices, *locks.values())):
+            raise ValueError("饰品须为攻击、防御或 TP")
+        object.__setattr__(self, "accessories", choices)
+        object.__setattr__(self, "accessory_locks", tuple(sorted(locks.items())))
         groups = tuple(self.groups)
         names = [group.name for group in groups]
         if len(set(names)) != len(names):
@@ -153,6 +172,8 @@ class RosterSettings:
             "to_max_attr": bool(self.to_max_attr),
             "verify": bool(self.verify),
             "every_combo": bool(self.every_combo),
+            "accessories": list(self.accessories),
+            "accessory_locks": dict(self.accessory_locks),
         }
 
     @classmethod
@@ -176,6 +197,7 @@ class RosterSettings:
             to_max_attr=bool(data.get("to_max_attr", True)),
             verify=bool(data.get("verify", True)),
             every_combo=bool(data.get("every_combo", True)),
+            accessories=data.get("accessories", ()), accessory_locks=data.get("accessory_locks", ()),
         )
 
     def with_changes(self, **changes) -> "RosterSettings":
@@ -183,6 +205,20 @@ class RosterSettings:
 
 
 # ---------------------------------------------------------------- 枚举
+def accessory_options(settings, team, clan):
+    if clan:
+        return ()
+    locks = dict(settings.accessory_locks)
+    return tuple((locks[u],) if u in locks else settings.accessories or ("攻击",) for u in team)
+
+
+def accessory_text(team, kinds, names=None):
+    if not kinds:
+        return "会战 EX"
+    by_unit = dict(zip(team, kinds, strict=True))
+    return "、".join(f"{(names or {}).get(u, u)}({by_unit[u]})" for u in lineup_order(team))
+
+
 def fixed_groups(settings: RosterSettings) -> tuple[GroupSpec, ...]:
     """真正参与配额的分组：设了最少人数，包括候选池暂时无法满足的分组。"""
     return tuple(
@@ -274,6 +310,7 @@ class TeamScore:
     frames: int
     result: int
     toggles: tuple[bool, ...] = ()
+    accessories: tuple[str, ...] = ()
 
     @property
     def is_win(self) -> bool:
@@ -285,6 +322,7 @@ class TeamScore:
             "frames": int(self.frames),
             "result": int(self.result),
             "toggles": [bool(flag) for flag in self.toggles],
+            "accessories": list(self.accessories),
         }
 
     @classmethod
@@ -294,6 +332,7 @@ class TeamScore:
             frames=int(data.get("frames") or 0),
             result=int(data.get("result") if data.get("result") is not None else -1),
             toggles=tuple(bool(flag) for flag in (data.get("toggles") or ())),
+            accessories=tuple(data.get("accessories") or ()),
         )
 
 
@@ -351,12 +390,13 @@ def lineup_text(
     *,
     width=None,
 ) -> str:
-    """「1 花音 SET（O）、2 纳娜 AUTO（X）…」，按站位排，带站位号。"""
+    """按实际站位列出每人的 O/X。"""
     labels = names or {}
     parts = []
-    for position, unit in enumerate(lineup_order(units, width=width), start=1):
+    for unit in lineup_order(units, width=width):
         label = str(labels.get(int(unit)) or unit)
-        parts.append(f"{position} {label} {toggle_text((_flag_of(units, toggles, unit),))}")
+        flag = "O" if _flag_of(units, toggles, unit) else "X"
+        parts.append(f"{label}({flag})")
     return "、".join(parts)
 
 
@@ -370,6 +410,7 @@ class TeamEvaluator:
         self.endpoint = simulation_url(settings.endpoint)
         self.battles = 0
         self._client = httpx.Client(timeout=float(settings.timeout))
+        self.cancelled = lambda: False
         self._template = [dict(player) for player in save.players]
         self._originals = {player["unitId"]: player for player in save.players}
         self._max_players: dict[int, dict] = {}
@@ -387,25 +428,26 @@ class TeamEvaluator:
         self.close()
 
     # -------------------------------------------------------- 组请求
-    def team_players(self, units: Sequence[int]) -> list[dict]:
-        if self.save.is_labyrinth:
-            self._prepare_labyrinth_players(units)
+    def team_players(self, units: Sequence[int], accessories=()) -> list[dict]:
+        explicit = not self.save.is_clan_battle or not self.settings.to_max_attr
+        if explicit:
+            self._prepare_players(units)
         players = []
         for index, unit in enumerate(units):
             template = self._template[index % len(self._template)]
             player = {key: template[key] for key in ROLE_KEYS if key in template}
-            player["unitId"] = int(unit)
-            if self.save.is_labyrinth:
+            player["unitId"] = unit
+            if explicit:
                 trained = self._max_players[unit]
-                if self.settings.to_max_attr:
-                    player = trained
+                player = dict(trained if self.settings.to_max_attr else self._originals.get(unit, player))
+                if self.save.is_clan_battle:
+                    player.update({k: v for k, v in trained.items() if k.startswith("exEquip")})
                 else:
-                    player = dict(self._originals.get(unit, player))
-                    player.update({key: value for key, value in trained.items() if key.startswith("exEquip")})
+                    player.update(normal_equipment(trained, accessories[index]))
             players.append(player)
         return players
 
-    def _prepare_labyrinth_players(self, units) -> None:
+    def _prepare_players(self, units) -> None:
         missing = [unit for unit in dict.fromkeys(units) if unit not in self._max_players]
         for start in range(0, len(missing), TEAM_SIZE):
             team = missing[start:start + TEAM_SIZE]
@@ -422,7 +464,26 @@ class TeamEvaluator:
                 raise TuneError("算器没有返回该队五人的练度与 EX 装备")
             for profile in profiles:
                 player = {key: profile[key] for key in UNIT_FIELDS if key in profile}
-                self._max_players[player["unitId"]] = {**player, **labyrinth_equipment(player)}
+                self._max_players[player["unitId"]] = player
+
+    def warm_pool(self, cancelled):
+        """一次引入最多五个新角色。预加载场次不参加正式排名。"""
+        units = self.settings.pool
+        if len(units) <= TEAM_SIZE:
+            return 0
+        completed = 0
+        for start in range(0, len(units), TEAM_SIZE):
+            if cancelled():
+                break
+            team = tuple(dict.fromkeys((*units[start:start + TEAM_SIZE], *units[:TEAM_SIZE])))[:TEAM_SIZE]
+            if not self.save.is_clan_battle or not self.settings.to_max_attr:
+                self._prepare_players(team)
+            else:
+                request = self.request_for(team, toggles=(True,) * TEAM_SIZE)
+                request.update(BattleTime=1, NeedOnceResult=False)
+                self._post([request])
+            completed += min(TEAM_SIZE, len(units) - start)
+        return completed
 
     def combos(self, size: int = TEAM_SIZE) -> list[tuple[bool, ...]]:
         """一支队伍要试的 AUTO / SET 组合。
@@ -442,7 +503,7 @@ class TeamEvaluator:
         return [tuple(bool(flag) for flag in flags) for flags in itertools.product((False, True), repeat=size)]
 
     def request_for(self, units: Sequence[int], seed: int | None = None,
-                   toggles: Sequence[bool] = ()) -> dict:
+                   toggles: Sequence[bool] = (), accessories=()) -> dict:
         # SetToggles[i] 在服务器里是按「站位槽位」生效的（内部按 searchAreaWidth 排序后
         # ``playerUnitCtrl[i].pressing = allSet || setToggles[i]``），跟 PlayerList 里的先后无关。
         # 实测：同一组 toggles 换队伍顺序，伤害只跟「第几个位置是 true」有关（只花音 SET =
@@ -450,13 +511,19 @@ class TeamEvaluator:
         # 这样「第 K 位是 O」就真的是那个站位的角色 SET。
         order = lineup_order(tuple(int(unit) for unit in units))
         flags = tuple(_flag_of(units, toggles, unit) for unit in order)
+        ordered_gear = ()
+        if not self.save.is_clan_battle:
+            if not accessories:
+                accessories = tuple(row[0] for row in accessory_options(self.settings, units, False))
+            by_unit = dict(zip(units, accessories, strict=True))
+            ordered_gear = tuple(by_unit[u] for u in order)
         body = dict(self._context)
         body["Settings"] = {**self._context["Settings"], "RandomSeed": int(self.settings.seed if seed is None else seed)}
         body.update(
-            PlayerList=self.team_players(order),
+            PlayerList=self.team_players(order, ordered_gear),
             CalcStats=1,
             IsSkipping=True,
-            ToMaxUnitAttr=bool(self.settings.to_max_attr and not self.save.is_labyrinth),
+            ToMaxUnitAttr=bool(self.settings.to_max_attr and self.save.is_clan_battle),
             # 轴里的帧是「帧模式」的手动刀表，不是 AUTO / SET，阵容搜索一律不带
             UBExecTimeList=[],
             SemanUBExecTimeList=[],
@@ -483,85 +550,47 @@ class TeamEvaluator:
         combos_override: Sequence[Sequence[bool]] | None = None,
     ) -> list[TeamScore]:
         """每支队伍试完所有 AUTO/SET 组合（×种子），取伤害最高的那种。"""
-        plans: list[tuple[int, tuple[bool, ...]]] = []
-        requests: list[dict] = []
-        combos = (
-            [tuple(bool(flag) for flag in combo) for combo in combos_override]
-            if combos_override is not None
-            else self.combos(TEAM_SIZE)
-        )
-        seeds = self.settings.seeds()
-        if self.save.is_labyrinth:
-            self._prepare_labyrinth_players(itertools.chain.from_iterable(teams))
-        for index, team in enumerate(teams):
-            for combo in combos:
-                plans.append((index, combo))
-                for seed in seeds:
-                    requests.append(self.request_for(team, seed, combo))
-        replies = self._post(requests)
-        best: dict[int, TeamScore] = {}
-        cursor = 0
-        for index, combo in plans:
-            damages = []
-            frames = 0
-            worst = -1
-            for _ in seeds:
-                reply = replies[cursor]
-                cursor += 1
-                damages.append(int(reply["damage"]))
-                frames = max(frames, int(reply["frames"]))
-                worst = max(worst, int(reply["result"]))
-            damage = sum(damages) // len(damages)
-            current = best.get(index)
-            if current is None or damage > current.damage:
-                best[index] = TeamScore(damage, frames, worst, combo)
+        combos = self.combos() if combos_override is None else combos_override
+        best = {}
+        for index, score in self._scores(teams, combos):
+            if index not in best or score.damage > best[index].damage:
+                best[index] = score
         return [best[index] for index in range(len(teams))]
 
-    def evaluate_all(self, units: Sequence[int]) -> list[tuple[tuple[bool, ...], TeamScore]]:
-        """把一支队伍的每种 AUTO/SET 都打一遍，返回 [(组合, 分数)]（按伤害降序）。
-
-        请求一次性并发发出去（和搜索时同一条通道），比一种组合发一次快得多。
-        """
-        team = tuple(int(unit) for unit in units)
-        if len(team) != TEAM_SIZE:
-            raise ValueError(f"队伍必须是 {TEAM_SIZE} 个人（现在是 {len(team)} 个）")
-        if len(set(team)) != len(team):
-            raise ValueError("同一支队伍里不能有重复角色")
-        combos = list(itertools.product((False, True), repeat=TEAM_SIZE))
+    def _scores(self, teams, combos):
+        if not self.save.is_clan_battle or not self.settings.to_max_attr:
+            self._prepare_players(itertools.chain.from_iterable(teams))
+        options = [accessory_options(self.settings, team, self.save.is_clan_battle) for team in teams]
+        plans = ((index, flags, gear) for flags in combos for index in range(len(teams))
+                 for gear in itertools.product(*options[index]))
         seeds = self.settings.seeds()
-        requests: list[dict] = []
-        for combo in combos:
-            for seed in seeds:
-                requests.append(self.request_for(team, seed, combo))
-        replies = self._post(requests)
-        results: list[tuple[tuple[bool, ...], TeamScore]] = []
-        cursor = 0
-        for combo in combos:
-            damages = []
-            frames = 0
-            worst = -1
-            for _ in seeds:
-                reply = replies[cursor]
-                cursor += 1
-                damages.append(int(reply["damage"]))
-                frames = max(frames, int(reply["frames"]))
-                worst = max(worst, int(reply["result"]))
-            damage = sum(damages) // len(damages)
-            results.append((combo, TeamScore(damage, frames, worst, combo)))
-        results.sort(key=lambda item: -int(item[1].damage))
-        return results
+        batch = max(1, self.settings.batch_size * POST_WORKERS // len(seeds))
+        while block := list(itertools.islice(plans, batch)):
+            if self.cancelled():
+                raise RosterCancelled()
+            requests = [self.request_for(teams[index], seed, flags, gear)
+                        for index, flags, gear in block for seed in seeds]
+            replies = iter(self._post(requests))
+            for index, flags, gear in block:
+                samples = [next(replies) for _ in seeds]
+                yield index, TeamScore(sum(r["damage"] for r in samples) // len(seeds),
+                                       max(r["frames"] for r in samples), max(r["result"] for r in samples),
+                                       tuple(flags), gear)
 
-    def labyrinth_result_save(self, team: Sequence[int], toggles: Sequence[bool]) -> SaveFile:
+    def evaluate_all(self, units: Sequence[int]) -> list[tuple[tuple[bool, ...], TeamScore]]:
+        team = tuple(map(int, units))
+        if len(team) != TEAM_SIZE or len(set(team)) != TEAM_SIZE:
+            raise ValueError("队伍必须由五个不同角色组成")
+        combos = itertools.product((False, True), repeat=TEAM_SIZE)
+        rows = [(score.toggles, score) for _, score in self._scores([team], combos)]
+        return sorted(rows, key=lambda row: -row[1].damage)
+
+    def result_save(self, team: Sequence[int], toggles: Sequence[bool], accessories=()) -> SaveFile:
         """把首种子的实放帧和同场角色写入结果轴，避免沿用换人前的刀表。"""
         from copy import deepcopy
 
-        body = self.request_for(team, toggles=toggles)
+        body = self.request_for(team, toggles=toggles, accessories=accessories)
         body["CalcStats"] = 3
-        reply = self._fetch([body])[0]
-        self._item(reply, body, 0)
-        frames = frame_axis(reply["Stats"].get("UBTime"), "阵容实放 UB")
-        if len(frames) < TEAM_SIZE:
-            raise TuneError("算器没有返回黎明阵容的五条实放 UB 记录")
         players = deepcopy(body["PlayerList"])
         raw = deepcopy(self.save.raw)
         group = raw["playerGroupData"]
@@ -569,7 +598,22 @@ class TeamEvaluator:
         group["SemanUBExecTimeData"] = []
         group["SemanUBSequenceData"] = []
         raw.pop("exequipImages", None)
-        return replace(self.save, raw=raw, players=players, frames=frames, semantic=[], sequence=None)
+        from .recovery import verifying
+        candidate = replace(self.save, raw=raw, players=players, frames=[], semantic=[], sequence=None)
+        with verifying([], None, save=candidate, auto_mode=body["IsAutoMode"],
+                       notes=[["队伍与 SET", lineup_combo(team, toggles)], ["EX 饰品", accessory_text(team, accessories)],
+                              ["实放帧", "回包成功后生成"]]):
+            reply = self._fetch([body])[0]
+            self._item(reply, body, 0)
+            if body["ToMaxUnitAttr"]:
+                profiles = {p["unitId"]: p for p in reply["PlayerList"]}
+                players = [{k: v for k, v in profiles[p["unitId"]].items() if k in UNIT_FIELDS} for p in players]
+                candidate.group["playerData"]["playrCharacters"] = players
+                candidate = replace(candidate, players=players)
+            frames = frame_axis(reply["Stats"].get("UBTime"), "阵容实放 UB")
+            if len(frames) < TEAM_SIZE:
+                raise TuneError("算器没有返回阵容的五条实放 UB 记录")
+        return replace(candidate, frames=frames)
 
     def _post(self, requests: list[dict]) -> list[dict]:
         """按 batch_size 拆成若干批并行发（POST_WORKERS 个），回包顺序与请求一致。"""
@@ -673,7 +717,7 @@ def evaluate_team(
     try:
         results = engine.evaluate_all(units)
         for flags, score in results:
-            log(f"{lineup_combo(units, flags)} → {int(score.damage):,}（战斗帧 {int(score.frames)}）")
+            log(f"{lineup_combo(units, flags)} {accessory_text(units, score.accessories)} → {int(score.damage):,}（战斗帧 {int(score.frames)}）")
         return results
     finally:
         if own:
@@ -713,6 +757,7 @@ class RosterJob:
         if self._evaluator is None:
             self._evaluator = TeamEvaluator(self.save, self.settings, log=self.log)
             self._evaluator.expected_damage = self.expected_damage
+            self._evaluator.cancelled = lambda: self.cancelled_requested
         return self._evaluator
 
     @property
@@ -741,6 +786,9 @@ class RosterJob:
         if self.cancelled_requested:
             raise RosterCancelled()
 
+    def gear_count(self, team):
+        return math.prod(map(len, accessory_options(self.settings, team, self.save.is_clan_battle)))
+
     def _chunk_size(self) -> int:
         """一次拿几支队伍去打：刚好够铺满 POST_WORKERS 个并行请求。"""
         combos = len(self.evaluator.combos(TEAM_SIZE))
@@ -754,23 +802,31 @@ class RosterJob:
         self._started = started
         combos = len(self.evaluator.combos(TEAM_SIZE))
         seeds = max(1, int(self.settings.samples))
+        multiple = len(self.settings.accessories) > 1 and not self.save.is_clan_battle
         total_battles = self.teams_total * combos * seeds
-        self.log(f"=== 阵容搜索：共 {self.teams_total} 支队伍 × {combos} 种 AUTO/SET × {seeds} 个种子 = {total_battles} 场 ===")
-        if self.save.is_labyrinth:
-            self.log(f"黎明界 EX 配装：{LABYRINTH_EX}")
+        self.log(f"=== 阵容搜索：共 {self.teams_total} 支队伍 × {combos} 种 AUTO/SET × {seeds} 个种子"
+                 + ("，每队再遍历所选饰品组合 ===" if multiple else f" = {total_battles} 场 ==="))
+        if not self.save.is_clan_battle:
+            self.log(f"非会战 EX：{NORMAL_EX}，饰品 {'、'.join(self.settings.accessories or ('攻击',))}。")
         for group in self.settings.groups:
             if group.members:
                 self.log(f"分组 {group.label}：{','.join(str(unit) for unit in group.members)}")
         free = ungrouped(self.settings)
         self.log(f"未分组 {len(free)} 人：{','.join(str(unit) for unit in free)}")
 
-        if (self.reference is None and len(self.save.unit_ids) == TEAM_SIZE
+        if self.teams_total and not self.cancelled_requested and len(self.settings.pool) > TEAM_SIZE:
+            self.log("阵容搜索：先分队载入候选角色资源，再比较各队操作。")
+            count = self.evaluator.warm_pool(lambda: self.cancelled_requested)
+            self.log(f"阵容搜索：已预载 {count} 名候选角色。")
+        if (not self.cancelled_requested and self.reference is None and len(self.save.unit_ids) == TEAM_SIZE
                 and all(unit in self.settings.pool for unit in self.save.unit_ids)):
             try:
                 self.reference = self.evaluator.evaluate([self.save.unit_ids])[0]
-                self.battles_done += combos * seeds
+                self.battles_done += combos * seeds * self.gear_count(self.save.unit_ids)
                 self.log(f"参考（当前队伍）：期望伤害 {self.reference.damage:,} × 战斗帧 {self.reference.frames} / 结果 {self.reference.result}"
                          f"（{lineup_combo(self.save.unit_ids, self.reference.toggles)}）")
+            except RosterCancelled:
+                self.cancelled = True
             except TuneError as exc:  # 参考打不出来不影响搜索
                 self.log(f"[warn] 参考队伍打不出来：{exc}")
         if self.cancelled_requested:
@@ -781,7 +837,7 @@ class RosterJob:
         chunk = self._chunk_size()
         combos_per_team = len(self.evaluator.combos(TEAM_SIZE)) * seeds
         self.log(
-            f"每批 {chunk} 支队伍（{chunk * combos_per_team} 场）。第一批要等摸轴器把数据读进来并预热，"
+            f"每批最多 {chunk} 支队伍，每套配装计算 {combos_per_team} 场。第一批要等摸轴器把数据读进来并预热，"
             "通常几秒到几十秒，之后就快了。"
         )
         buffer: list[tuple[int, ...]] = []
@@ -813,6 +869,7 @@ class RosterJob:
         self.export = {
             "team": list(self.best_team),
             "toggles": list(self.best_score.toggles),
+            "accessories": list(self.best_score.accessories),
             "damage": int(self.best_score.damage),
             "frames": int(self.best_score.frames),
             "result": int(self.best_score.result),
@@ -822,7 +879,8 @@ class RosterJob:
             f"（{lineup_combo(self.best_team, self.best_score.toggles)}） ==="
         )
         self.log(f"最优阵容（按站位）：{lineup_names(self.best_team, self.names)}")
-        self.log(f"每位角色的操作：{lineup_text(self.best_team, self.best_score.toggles, self.names)}")
+        self.log(f"操作：{lineup_text(self.best_team, self.best_score.toggles, self.names)}")
+        self.log(f"EX 饰品：{accessory_text(self.best_team, self.best_score.accessories, self.names)}")
         self.log(f"共 {self.teams_done}/{self.teams_total} 支队伍 / {self.battles_done} 场 / 用时 {time.time() - started:.1f}s")
         return self.summary(time.time() - started)
 
@@ -836,7 +894,7 @@ class RosterJob:
         spent = time.time() - began
         combos = len(self.evaluator.combos(TEAM_SIZE))
         seeds = max(1, int(self.settings.samples))
-        actual_battles = len(pending) * combos * seeds
+        actual_battles = sum(self.gear_count(team) for team in pending) * combos * seeds
         self.battles_done += actual_battles
         self.battle_seconds += spent
         self.chunks += 1
@@ -867,6 +925,7 @@ class RosterJob:
             "frames": int(score.frames),
             "result": int(score.result),
             "toggles": [bool(flag) for flag in score.toggles],
+            "accessories": list(score.accessories),
         }
         if len(self.results) < RESULT_LIMIT:
             self.results.append(entry)
@@ -903,6 +962,7 @@ class RosterJob:
             "teams_done": int(self.teams_done),
             "combos": len(self.evaluator.combos(TEAM_SIZE)),
             "every_combo": bool(self.settings.every_combo),
+            "gear_policy": self.gear_policy(),
             "to_max_attr": bool(self.settings.to_max_attr),
             "groups": [group.to_dict() for group in self.settings.groups],
             "pool": list(self.settings.pool),
@@ -923,7 +983,7 @@ class RosterJob:
             "mode": "roster",
             "cursor": int(self.teams_done),
             "enumeration_version": 2,
-            "labyrinth_ex": LABYRINTH_EX if self.save.is_labyrinth else None,
+            "gear_policy": self.gear_policy(),
             "expected_damage": self.expected_damage,
             "teams": list(self.results),
             "battles": int(self.battles_done),
@@ -933,15 +993,23 @@ class RosterJob:
             "export": self.export,
         }
 
+    def gear_policy(self):
+        if self.save.is_clan_battle:
+            return "会战 EX"
+        return {"choices": sorted(self.settings.accessories or ("攻击",)),
+                "locks": {str(u): k for u, k in self.settings.accessory_locks}}
+
     def apply_state(self, data: dict) -> None:
-        if self.save.is_labyrinth and data.get("labyrinth_ex") != LABYRINTH_EX:
-            self.log("旧进度使用了不同的黎明界配装，将从第一队重新评分。")
+        policy = data.get("gear_policy")
+        legacy_clan = policy is None and self.save.is_clan_battle and self.settings.to_max_attr
+        if not legacy_clan and policy != self.gear_policy():
+            self.log("配装规则已变化，重新按本次饰品设置评分。")
             return
         if fixed_groups(self.settings) and data.get("enumeration_version") != 2:
             self.log("旧版分组进度使用了不同的枚举顺序，本次将重新遍历符合最少人数的队伍。")
             return
         self.expected_damage = bool(data.get("expected_damage", False))
-        self.results = list(data.get("teams", ()))[:RESULT_LIMIT]
+        self.results = sorted(data.get("teams", ()), key=lambda item: -int(item["damage"]))[:RESULT_LIMIT]
         self.teams_done = int(data.get("cursor") or 0)
         self.battles_done = int(data.get("battles") or 0)
         team = data.get("best_team") or []

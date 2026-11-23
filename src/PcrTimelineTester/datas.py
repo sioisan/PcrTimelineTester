@@ -224,6 +224,11 @@ def _info_for(info: dict[int, UnitInfo], unit_id: int) -> UnitInfo | None:
     return info.get(unit) or info.get(unit // 100)
 
 
+def unit_talent(unit_id: int) -> int | None:
+    entry = _info_for(_unit_info(), unit_id)
+    return entry.talent if entry else None
+
+
 def unit_width(unit_id: int) -> int | None:
     """角色的攻击范围（越大越靠后）。战斗里的站位就是这个值从小到大排出来的。"""
     entry = _info_for(_unit_info(), unit_id)

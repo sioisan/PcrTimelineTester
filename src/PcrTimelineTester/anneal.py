@@ -13,6 +13,8 @@
 
 from __future__ import annotations
 
+from .recovery import verifying
+
 from dataclasses import dataclass, field, replace
 import math
 import random
@@ -673,7 +675,9 @@ class AnnealJob:
         self.state = best_state or self.state
 
         best_lanes = full(prepared.prefix, self.state.best.genome) if self.state and self.state.best else prepared.seed_lanes
-        replay_eval, frames = self.evaluator.replay(best_lanes, prepared.roles)
+        with verifying([], self.state.best.evaluation.mean_damage if self.state and self.state.best else 0,
+                       semantic=best_lanes, sequence=prepared.roles):
+            replay_eval, frames = self.evaluator.replay(best_lanes, prepared.roles)
         self.log(f"导出前复核：期望伤害 {replay_eval.mean_damage:,} × 战斗帧 {replay_eval.frames}")
         sequence = prepared.roles
         self.export = {

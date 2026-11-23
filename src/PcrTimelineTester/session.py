@@ -8,13 +8,15 @@ same "write the axis once at the end" rule, same exit codes.
 
 from __future__ import annotations
 
+from .recovery import keep_failed_candidate
+
 from pathlib import Path
 import time
 from typing import Any, Callable, Sequence
 
 from .frames import text
 from .job import JobSettings, TuneJob
-from .roster import lineup_names, lineup_text
+from .roster import accessory_text, lineup_names, lineup_text
 from .report import (
     CONFIG, LOG, REPORT_JSON, REPORT_MD, RESULT_WORKBOOK, STATE, write_json, write_report,
 )
@@ -116,6 +118,7 @@ class TuneSession:
 
     # --------------------------------------------------------------------- run
 
+    @keep_failed_candidate
     def run(self) -> int:
         """Blocking: returns ``OK`` or ``CANCELLED``; nothing is raised for cancels."""
         summary = self.job.run()
@@ -231,6 +234,7 @@ class GaSession:
 
     # --------------------------------------------------------------------- run
 
+    @keep_failed_candidate
     def run(self) -> int:
         from .ga.job import GaCancelled
         from .report import write_ga_report
@@ -370,6 +374,7 @@ class AnnealSession:
 
     # --------------------------------------------------------------------- run
 
+    @keep_failed_candidate
     def run(self) -> int:
         from .anneal import AnnealCancelled
         from .report import write_anneal_report
@@ -432,13 +437,13 @@ def roster_workbook_summary(summary: dict, *, names: dict[int, str] | None = Non
         ["接口", f"{summary.get('endpoint')}（{summary.get('battle_time')} 秒 / 种子 {summary.get('seed')}）"],
         ["候选角色", f"{len(summary.get('pool') or [])} 个，队伍固定 5 人"],
         ["分组", "；".join(str(group.get("label") or group.get("name")) for group in groups) or "没有分组"],
-        ["队伍 / 组合", f"{int(summary.get('teams_total') or 0):,} 支 × {combos} 种 AUTO/SET"],
+        ["队伍 / 操作", f"{int(summary.get('teams_total') or 0):,} 支，每套饰品 {combos} 种 AUTO/SET"],
         ["属性", "满级满 Rank" if summary.get("to_max_attr") else "沿用轴里的练度"],
         ["参考伤害", _number_text((summary.get("reference") or {}).get("damage"))],
         ["最优期望伤害", _number_text(summary.get("final"))],
         ["模拟场次", f"{int(summary.get('battles') or 0):,} 场"],
         [],
-        ["队伍", "角色", "每位角色的操作"],
+        ["队伍", "角色", "操作", "伤害", "EX 饰品"],
     ]
     team = export.get("team") or []
     toggles = export.get("toggles") or []
@@ -447,7 +452,8 @@ def roster_workbook_summary(summary: dict, *, names: dict[int, str] | None = Non
             [
                 "最优阵容（按站位）",
                 lineup_names(team, names),
-                lineup_text(team, toggles, names),
+                lineup_text(team, toggles, names), summary.get("final"),
+                accessory_text(team, export.get("accessories"), names),
             ]
         )
     rows.append([])
@@ -463,7 +469,8 @@ def roster_workbook_summary(summary: dict, *, names: dict[int, str] | None = Non
                 [
                     f"第 {rank} 名",
                     lineup_names(members, names),
-                    f"{lineup_text(members, flags, names)} ｜ 伤害 {_number_text(item.get('damage'))}",
+                    lineup_text(members, flags, names), int(item.get("damage") or 0),
+                    accessory_text(members, item.get("accessories"), names),
                 ]
             )
     rows.append(["说明", "本文件由 PcrTimelineTester 生成；导入 PCRCalculator 即可使用（savePage 为隐藏数据页，角色已换成最优阵容）。"])
@@ -495,7 +502,7 @@ class RosterSession:
         self.log = log
         self.summary: dict = {}
         self.workbook: Path | None = None
-        self.names = dict(names or {})
+        self.names = {**save.names, **(names or {})}
         write_json(self.run_dir / CONFIG, {
             "excel": str(save.path),
             "mode": "roster",
@@ -527,9 +534,10 @@ class RosterSession:
 
     # --------------------------------------------------------------------- run
 
+    @keep_failed_candidate
     def run(self) -> int:
         from .report import write_roster_report
-        from .roster import LABYRINTH_EX, save_with_team
+        from .roster import NORMAL_EX
 
         started = time.perf_counter()
         summary = self.job.run()
@@ -546,11 +554,9 @@ class RosterSession:
         export = summary.get("export") or {}
         team = tuple(int(unit) for unit in (export.get("team") or self.job.best_team or ()))
         rows = roster_workbook_summary(summary, names=self.names)
-        if team and self.save.is_labyrinth:
-            tuned = self.job.evaluator.labyrinth_result_save(team, export["toggles"])
-            rows.append(["黎明界 EX", LABYRINTH_EX, "帧轴记录首个种子下最优组合实际释放的 UB。"])
-        else:
-            tuned = save_with_team(self.save, team) if team else self.save
+        tuned = self.job.evaluator.result_save(team, export["toggles"], export.get("accessories", ()))
+        rows.append(["EX 配装", "会战 EX" if self.save.is_clan_battle else NORMAL_EX,
+                     "帧轴记录首个种子下该配装和操作的实放 UB。"])
         workbook = self.run_dir / self.workbook_name
         write_tuned_save(
             workbook, tuned, tuned.frames,
@@ -616,12 +622,15 @@ def zero_workbook_summary(summary: dict, *, names: dict[int, str] | None = None)
         ["站位", "角色", "逐刀设定（O=SET、X=AUTO）"],
     ]
     plan = best.get("plan") or []
-    for index, unit in enumerate(units):
+    for index, unit in enumerate(units if not best.get("steps") else ()):
         flags = plan[index] if index < len(plan) else []
         body = "".join("O" if flag else "X" for flag in flags) or "O"
         tail = "O" if (flags[-1] if flags else True) else "X"
         rows.append([f"{index + 1}", names.get(unit, str(unit)), f"{body}（之后一律 {tail}）"])
     rows.append([])
+    if best.get("steps"):
+        rows.append(["按时间执行的 UB 操作"])
+        rows.extend([[step] for step in best["steps"]])
     rows.append(["刷新记录", "轮次", "逐刀设定", "期望伤害"])
     for item in summary.get("history") or ():
         rows.append(
@@ -636,7 +645,7 @@ def zero_workbook_summary(summary: dict, *, names: dict[int, str] | None = None)
     rows.append(
         [
             "说明",
-            "本文件由 PcrTimelineTester 生成；轴本身没有手动 UB，导入后请按上表逐刀设置 O（能按就按）/ X（交给自动）。",
+            "锚点轴按上表的触发时机执行 SET 或 AUTO，其余时段保留 TP。",
         ]
     )
     rows.append(["生成时间", time.strftime("%Y-%m-%d %H:%M:%S")])
@@ -712,6 +721,7 @@ class ZeroSession:
         return self.run_dir / REPORT_MD
 
     # --------------------------------------------------------------------- run
+    @keep_failed_candidate
     def run(self) -> int:
         from .report import write_zero_report
 
@@ -729,8 +739,13 @@ class ZeroSession:
             self.log(f"续跑：PcrTimelineTester resume \"{self.run_dir}\"")
             return CANCELLED
         workbook = self.run_dir / self.workbook_name
+        export = summary["export"]
+        export_frames = self.save.frames
+        if export.get("steps"):
+            by_unit = dict(zip(self.job.units, export["lanes"][:5]))
+            export_frames = [by_unit[u] for u in self.save.unit_ids] + export["lanes"][5:]
         write_tuned_save(
-            workbook, self.save, self.save.frames,
+            workbook, self.save, export_frames,
             battle_seed=self.settings.seed,
             damage=int((summary.get("best") or {}).get("damage") or 0),
             summary=zero_workbook_summary(summary, names=self.names),
